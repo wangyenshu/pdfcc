@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""pdfcc - compile C/C++ programs into PDF files for Chromium's PDF viewer.
+
+  pdfcc hello.c -o hello.pdf
+  pdfcc game.c -o game.pdf --display 160x120 --buttons arrows
+  pdfcc main.c libfoo.a -O2 -o foo.pdf --memory 128   # link prebuilt objects/archives
+  pdfcc prog.c --async -o prog.pdf                    # blocking stdin and sleep()
+  eval "$(pdfcc --env --toolchain upstream)"          # emcc/emconfigure/emmake for a
+                                                      # project's own build system
+
+Unrecognised arguments go to emcc: sources (.c .cc .cpp .cxx) are compiled in
+parallel, .o/.a/.bc files and -l/-L are linked, other flags (-O, -I, -D, -s...) are
+used for both. With -o NAME.js only the Emscripten output is written.
+"""
+import argparse
+import concurrent.futures
+import glob
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import mkpdf  # noqa: E402
+
+RUNTIME = os.path.join(ROOT, "runtime")
+SOURCE_EXT = (".c", ".cc", ".cpp", ".cxx", ".C")
+LINK_EXT = (".o", ".a", ".bc", ".obj")
+EXPORTS = ["_main", "_pdfcc_tick", "_pdfcc_stack_overflow", "_malloc", "_free"]
+
+
+def toolchain(explicit, upstream):
+    """Return (emcc path, environment).
+
+    fastcomp: Emscripten 1.39.20-fastcomp in ./emsdk (asm.js output; default)
+    upstream: Emscripten 4.x in ./emsdk-upstream (wasm2js output; required by --async)
+    PDFCC_EMSDK / PDFCC_EMSDK_UPSTREAM override the emsdk directories,
+    PDFCC_EMCC / PDFCC_EMCC_UPSTREAM the emcc path."""
+    env = dict(os.environ)
+    if explicit:
+        return explicit, env
+    var = "PDFCC_EMCC_UPSTREAM" if upstream else "PDFCC_EMCC"
+    if os.environ.get(var):
+        return os.environ[var], env
+    if upstream:
+        emsdk = os.environ.get("PDFCC_EMSDK_UPSTREAM", os.path.join(ROOT, "emsdk-upstream"))
+        emdir = os.path.join(emsdk, "upstream", "emscripten")
+    else:
+        emsdk = os.environ.get("PDFCC_EMSDK", os.path.join(ROOT, "emsdk"))
+        emdir = os.path.join(emsdk, "fastcomp", "emscripten")
+    if os.path.exists(os.path.join(emdir, "emcc")):
+        env["EMSDK"] = emsdk
+        env["EM_CONFIG"] = os.path.join(emsdk, ".emscripten")
+        env["EM_CACHE"] = os.path.join(emdir, "cache")
+        path = [emdir]
+        nodes = sorted(glob.glob(os.path.join(emsdk, "node", "*", "bin")))
+        if nodes:
+            path.append(nodes[-1])
+            env["EMSDK_NODE"] = os.path.join(nodes[-1], "node")
+        env["PATH"] = os.pathsep.join(path + [env.get("PATH", "")])
+        return os.path.join(emdir, "emcc"), env
+    if shutil.which("emcc"):
+        return shutil.which("emcc"), env
+    sys.exit("pdfcc: emcc not found; run ./setup.sh" + (" --async" if upstream else ""))
+
+
+def join_flag_args(args):
+    """Merge "-I dir", "-s X=1", "-L dir" etc. into one word, so flags can be split
+    between compiling and linking without separating a flag from its value."""
+    out, i = [], 0
+    while i < len(args):
+        if args[i] in ("-I", "-D", "-U", "-L", "-l", "-s") and i + 1 < len(args):
+            out.append(args[i] + args[i + 1])
+            i += 2
+        else:
+            out.append(args[i])
+            i += 1
+    return out
+
+
+def run(cmd, env):
+    if os.environ.get("PDFCC_VERBOSE"):
+        print(" ".join(cmd), file=sys.stderr)
+    r = subprocess.run(cmd, env=env)
+    if r.returncode:
+        sys.exit(r.returncode)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="pdfcc", description=__doc__, allow_abbrev=False,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-o", "--output", help="output .pdf (or .js)")
+    p.add_argument("--toolchain", choices=["fastcomp", "upstream"],
+                   help="fastcomp (default) or upstream; see toolchain() in this file")
+    p.add_argument("--async", dest="use_async", action="store_true",
+                   help="Asyncify: blocking stdin (fgets, scanf, read) and sleep(); implies upstream")
+    p.add_argument("--memory", type=int, metavar="MB", help="initial heap (default 16; 64 with --async)")
+    p.add_argument("--memory-growth", action="store_true", help="let the heap grow at run time")
+    p.add_argument("--stack", type=int, metavar="KB", help="C stack size")
+    p.add_argument("--env", action="store_true", help="print shell exports for the toolchain and exit")
+    p.add_argument("--keep-js", action="store_true", help="also write the Emscripten .js next to the PDF")
+    p.add_argument("--emcc", help="emcc to use")
+    p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 2)
+    mkpdf.add_cli_options(p)
+    a, rest = p.parse_known_args()
+    rest = join_flag_args(rest)
+
+    upstream = a.use_async or a.toolchain == "upstream"
+    emcc, env = toolchain(a.emcc, upstream)
+    if a.env:
+        for k in ("EMSDK", "EM_CONFIG", "EM_CACHE", "EMSDK_NODE"):
+            if k in env and env[k] != os.environ.get(k):
+                print(f"export {k}='{env[k]}'")
+        added = env["PATH"][:-len(os.environ.get("PATH", ""))].rstrip(os.pathsep)
+        print(f"export PATH='{added or os.path.dirname(emcc)}':\"$PATH\"")
+        return
+    if not a.output:
+        p.error("-o is required")
+
+    sources = [x for x in rest if x.endswith(SOURCE_EXT) and not x.startswith("-")]
+    objects = [x for x in rest if x.endswith(LINK_EXT) and not x.startswith("-")]
+    flags = [x for x in rest if x not in sources and x not in objects]
+    if not sources and not objects:
+        sys.exit("pdfcc: no input files")
+    cxx = any(s.endswith(SOURCE_EXT[1:]) for s in sources) or "-lstdc++" in flags
+    emxx = emcc[:-4] + "em++" if emcc.endswith("emcc") else emcc
+    if not any(re.match(r"-O[0-3sz]$", f) for f in flags):
+        flags.append("-O2")
+
+    exports = list(EXPORTS)  # merged with the user's -sEXPORTED_FUNCTIONS
+    for f in list(flags):
+        m = re.match(r"-s\s*EXPORTED_FUNCTIONS=\[?(.*?)\]?$", f)
+        if m:
+            exports += [e.strip(" '\"") for e in m.group(1).split(",") if e.strip(" '\"")]
+            flags.remove(f)
+    # -s settings go to the link, except those that also affect compilation
+    compile_settings = ("USE_", "DISABLE_EXCEPTION", "EXCEPTION", "SUPPORT_LONGJMP", "MEMORY64",
+                        "RELOCATABLE", "MAIN_MODULE", "SIDE_MODULE", "STRICT", "SHARED_MEMORY")
+    cflags = []
+    i = 0
+    while i < len(flags):
+        f = flags[i]
+        if f in ("--js-library", "--pre-js", "--post-js", "--embed-file", "--preload-file"):
+            i += 2  # link-only option and its value
+            continue
+        if not (f.startswith(("-l", "-L", "-Wl,", "--profiling"))
+                or (f.startswith("-s") and not f[2:].startswith(compile_settings))):
+            cflags.append(f)
+        i += 1
+    cflags.append("-I" + RUNTIME)
+    if not upstream:
+        cflags.append("-Wno-fastcomp")
+    if a.use_async:
+        cflags += ["-DPDFCC_ASYNC=1",
+                   "-I" + os.path.join(os.path.dirname(os.path.realpath(emcc)),
+                                       "system/lib/libc/musl/src/internal")]
+    ldflags = ["-sWASM=0", "-sSINGLE_FILE=1", "-sFORCE_FILESYSTEM=1", "-sENVIRONMENT=shell",
+               "-sEXPORTED_FUNCTIONS=[" + ",".join(f"'{e}'" for e in dict.fromkeys(exports)) + "]"]
+    if upstream:
+        ldflags += ["-sWASM_ASYNC_COMPILATION=0",
+                    "-sEXPORTED_RUNTIME_METHODS=['callMain','FS','UTF8ToString','stringToUTF8',"
+                    "'lengthBytesUTF8','stackSave','stackRestore']"]
+    else:
+        ldflags += ["-sEXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"]
+    mem = a.memory or (64 if a.use_async else None)
+    if mem and not upstream and mem % 16:
+        mem += 16 - mem % 16  # asm.js heaps are multiples of 16 MB
+        print(f"pdfcc: --memory rounded up to {mem} MB (asm.js)", file=sys.stderr)
+    if mem:
+        ldflags.append(f"-s{'INITIAL_MEMORY' if upstream else 'TOTAL_MEMORY'}={mem << 20}")
+    if a.memory_growth:
+        ldflags.append("-sALLOW_MEMORY_GROWTH=1")
+    if a.stack:
+        ldflags.append(f"-s{'STACK_SIZE' if upstream else 'TOTAL_STACK'}={a.stack << 10}")
+    if a.use_async:
+        ldflags += ["-sASYNCIFY=1", "-sASYNCIFY_STACK_SIZE=262144"]
+
+    build = tempfile.mkdtemp(prefix="pdfcc-")
+    try:
+        def obj(src):
+            h = hashlib.sha1(os.path.abspath(src).encode()).hexdigest()[:8]
+            return os.path.join(build, f"{os.path.basename(src)}.{h}.o")
+
+        def compile_one(src):
+            run([emcc if src.endswith(".c") else emxx] + cflags + ["-c", src, "-o", obj(src)], env)
+
+        runtime_c = os.path.join(RUNTIME, "pdfcc.c")
+        compile_one(runtime_c)  # alone first: emcc may build its library cache on first use
+        with concurrent.futures.ThreadPoolExecutor(max(1, a.jobs)) as ex:
+            for f in [ex.submit(compile_one, s) for s in sources]:
+                f.result()
+        js = a.output if a.output.endswith(".js") else os.path.join(build, "program.js")
+        run([emxx if cxx else emcc, obj(runtime_c)] + [obj(s) for s in sources] + objects +
+            flags + ldflags + ["-o", js], env)
+        if a.output.endswith(".js"):
+            return
+        if a.keep_js:
+            shutil.copy(js, os.path.splitext(a.output)[0] + ".js")
+        with open(js) as fh:
+            info = mkpdf.build(fh.read(), mkpdf.load_spec(a), a.output)
+        print(f"pdfcc: {a.output}: {info['bytes'] / 1e6:.2f} MB, {info['fields']} form fields")
+    finally:
+        shutil.rmtree(build, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

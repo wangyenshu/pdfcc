@@ -1,0 +1,14 @@
+{
+  "title": "Snake",
+  "subtitle": "Plain Emscripten code (emscripten_set_main_loop) running inside a PDF.",
+  "display": {"width": 128, "height": 80, "scale": 4.0},
+  "terminal": {"cols": 52, "rows": 6, "font_size": 7},
+  "buttons": [
+    {"label": "^", "key": "UP", "col": 1, "row": 0},
+    {"label": "<", "key": "LEFT", "col": 0, "row": 1},
+    {"label": "v", "key": "DOWN", "col": 1, "row": 1},
+    {"label": ">", "key": "RIGHT", "col": 2, "row": 1},
+    {"label": "new game", "key": "ENTER", "col": 4, "row": 1, "w": 2.5}
+  ],
+  "help": ["Click the box and use WASD, or press the buttons."]
+}

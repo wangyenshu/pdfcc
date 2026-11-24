@@ -1,0 +1,63 @@
+{
+  "title": "Mandelbrot",
+  "subtitle": "C compiled to asm.js; the image is drawn with PDF text fields.",
+  "display": {
+    "width": 240,
+    "height": 150,
+    "scale": 2.6,
+    "mode": "quality"
+  },
+  "terminal": {
+    "cols": 64,
+    "rows": 8,
+    "font_size": 6.5
+  },
+  "buttons": [
+    {
+      "label": "^",
+      "key": "UP",
+      "col": 1,
+      "row": 0
+    },
+    {
+      "label": "<",
+      "key": "LEFT",
+      "col": 0,
+      "row": 1
+    },
+    {
+      "label": "v",
+      "key": "DOWN",
+      "col": 1,
+      "row": 1
+    },
+    {
+      "label": ">",
+      "key": "RIGHT",
+      "col": 2,
+      "row": 1
+    },
+    {
+      "label": "+",
+      "key": "+",
+      "col": 4,
+      "row": 0
+    },
+    {
+      "label": "-",
+      "key": "-",
+      "col": 4,
+      "row": 1
+    },
+    {
+      "label": "plasma",
+      "key": "p",
+      "col": 5,
+      "row": 0,
+      "w": 2
+    }
+  ],
+  "help": [
+    "Keys: arrows or WASD pan, + / - zoom, p = plasma"
+  ]
+}

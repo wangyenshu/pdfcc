@@ -1,0 +1,7 @@
+{
+  "name": "pdfcc-tests",
+  "private": true,
+  "type": "module",
+  "description": "Chrome harness for pdfcc (npm install here, then node chrome.mjs file.pdf)",
+  "dependencies": { "puppeteer-core": "^23.0.0" }
+}

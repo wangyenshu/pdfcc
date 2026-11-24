@@ -1,0 +1,22 @@
+{
+  "title": "Doom",
+  "subtitle": "doomgeneric on the pdfcc runtime. Based on ading2210/doompdf.",
+  "display": {"width": 320, "height": 200, "scale": 2.2, "pixel_aspect": 1.2},
+  "terminal": {"cols": 64, "rows": 14, "font_size": 6},
+  "keyboard": {"placeholder": "Click here, then use the keys below"},
+  "buttons": [
+    {"label": "esc", "key": "ESC", "col": 0, "row": 0},
+    {"label": "^", "key": "UP", "col": 1, "row": 0},
+    {"label": "use", "key": "e", "col": 2, "row": 0},
+    {"label": "<", "key": "LEFT", "col": 0, "row": 1},
+    {"label": "v", "key": "DOWN", "col": 1, "row": 1},
+    {"label": ">", "key": "RIGHT", "col": 2, "row": 1},
+    {"label": "enter", "key": "ENTER", "col": 3.3, "row": 0, "w": 1.6},
+    {"label": "fire", "key": " ", "col": 3.3, "row": 1, "w": 1.6},
+    {"label": "map", "key": "m", "col": 4.9, "row": 0, "w": 1.2},
+    {"label": "run", "key": "SHIFT", "col": 4.9, "row": 1, "w": 1.2}
+  ],
+  "help": ["WASD move, shift+WASD run, q = esc, z = enter,",
+           "e = use, space = fire, m = map, 1-7 = weapons, , . = strafe"],
+  "slots": [{"name": "pwad", "path": "/pwad.wad", "args": ["-file", "/pwad.wad"]}]
+}

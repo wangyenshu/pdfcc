@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pdfcc - add files to a PDF program</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .slot { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; align-items: center;
+          padding: 10px 0; border-top: 1px solid #ddd; }
+  .slot small { grid-column: 2; color: #666; }
+  button { font: inherit; padding: 6px 16px; margin-top: 16px; }
+  #status { color: #a00; min-height: 1.5em; }
+  code { background: #f3f3f3; padding: 1px 4px; }
+</style>
+</head>
+<body>
+<h1>Add files to a pdfcc PDF</h1>
+<p>Select a PDF built by pdfcc (for example <code>doom_nowad.pdf</code>) and files for its slots.
+The new PDF is built locally; nothing is uploaded.</p>
+<p><label>PDF program: <input type="file" id="pdf" accept=".pdf"></label></p>
+<div id="slots"></div>
+<button id="build" disabled>Build PDF</button>
+<p id="status"></p>
+<p><small>Open the result in a Chromium-based browser. <code>?pdf=URL</code> preloads a PDF from
+the same site.</small></p>
+<script src="inject.js"></script>
+<script>
+  const $ = id => document.getElementById(id);
+  let pdfBytes = null, pdfName = "program.pdf";
+
+  function showSlots() {
+    const m = pdfccInject.readManifest(pdfBytes);
+    $("slots").innerHTML = "";
+    for (const s of m.slots) {
+      const row = document.createElement("div");
+      row.className = "slot";
+      row.innerHTML = `<b>${s.name}</b><input type="file" data-slot="${s.name}">` +
+        `<small>${s.path} - ${s.filled ? "has a file (leave empty to keep it)" : "empty"}` +
+        `${s.args ? ", adds arguments: " + s.args.join(" ") : ""}</small>`;
+      $("slots").appendChild(row);
+    }
+    $("build").disabled = false;
+    $("status").textContent = m.slots.length ? "" : "This PDF has no file slots.";
+  }
+
+  async function load(bytes, name) {
+    pdfBytes = bytes; pdfName = name;
+    try { showSlots(); } catch (e) { $("status").textContent = e.message; }
+  }
+
+  $("pdf").onchange = async e => {
+    const f = e.target.files[0];
+    if (f) load(new Uint8Array(await f.arrayBuffer()), f.name);
+  };
+
+  $("build").onclick = async () => {
+    const files = {};
+    for (const input of document.querySelectorAll("input[data-slot]")) {
+      const f = input.files[0];
+      if (f) files[input.dataset.slot] = { data: new Uint8Array(await f.arrayBuffer()) };
+    }
+    $("status").textContent = "Building...";
+    try {
+      const out = await pdfccInject.inject(pdfBytes, files);
+      const url = URL.createObjectURL(new Blob([out], { type: "application/pdf" }));
+      const a = document.createElement("a");
+      a.href = url; a.download = pdfName.replace(/(_nowad)?\.pdf$/i, "") + "_custom.pdf";
+      a.click();
+      window.open(url);
+      $("status").textContent = "";
+    } catch (e) { $("status").textContent = e.message; }
+  };
+
+  const param = new URLSearchParams(location.search).get("pdf");
+  if (param) fetch(param).then(r => r.arrayBuffer()).then(b => load(new Uint8Array(b), param.split("/").pop()));
+</script>
+</body>
+</html>
