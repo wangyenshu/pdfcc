@@ -1,0 +1,1377 @@
+% pdfcc.sty - run programs compiled by pdfcc in LaTeX documents.
+%
+% Reads the files written by tools/pdf2sty.py: pdfcc-NAME.tex (layout),
+% pdfcc-NAME.js (program) and pdfcc-runtime.js. See tex/README.md.
+% pdfLaTeX, XeLaTeX or LuaLaTeX, TeX Live 2023 or newer. The programs run in
+% Chromium's PDF viewer (PDFium) only.
+%
+% How it works. Each program instance owns one form field per terminal row,
+% display row and keyboard (the parent fields). Every placement of a
+% component adds widget annotations whose /Parent is such a field, so the
+% same terminal can be shown several times (Beamer overlays), and a placement
+% that is typeset but never shipped (tabularx trial runs, measuring boxes)
+% leaves nothing behind. A page that shows a program gets a page-open action
+% that runs: config, runtime, program, start; pdfcc_runtime.js makes every run
+% after the first return at once. Which pages show which program: LuaLaTeX
+% finds out while shipping the page; pdfLaTeX and XeLaTeX read it from the
+% .aux file and, until it is there, put the program on every page.
+\NeedsTeXFormat{LaTeX2e}[2023-06-01]
+\ProvidesExplPackage{pdfcc}{2026-11-25}{1.0}
+  {Programs compiled by pdfcc, in LaTeX documents}
+
+% ------------------------------------------------------------- messages --
+\msg_new:nnn { pdfcc } { engine }
+  { pdfcc~needs~pdfLaTeX,~XeLaTeX~or~LuaLaTeX~with~PDF~output. }
+\msg_new:nnn { pdfcc } { no-file }
+  { File~'#1'~not~found.~Write~it~with~tools/pdf2sty.py. }
+\msg_new:nnn { pdfcc } { bad-name }
+  { Program~name~'#1'~must~be~lowercase~letters~and~digits. }
+\msg_new:nnn { pdfcc } { duplicate }
+  { A~program~named~'#1'~is~already~loaded.~Use~\pdfccload[name=...]{...}. }
+\msg_new:nnn { pdfcc } { no-program }
+  { No~program~'#1'~loaded.~Load~it~with~\pdfccload{#1}. }
+\msg_new:nnn { pdfcc } { no-component }
+  { Program~'#1'~has~no~#2. }
+\msg_new:nnn { pdfcc } { load-only }
+  { Option~'#1'~belongs~in~\pdfccload;~ignored~here. }
+\msg_new:nnn { pdfcc } { bad-key }
+  { Unknown~key~'#1'.~Use~UP,~DOWN,~LEFT,~RIGHT,~SHIFT,~CTRL,~ALT,~ENTER,~ESC,~SPACE,~TAB,~BACKSPACE,~F1~to~F12,~one~character~or~a~number. }
+\msg_new:nnn { pdfcc } { rerun }
+  { Programs~are~on~other~pages~than~in~the~last~run.~Rerun~to~get~them~loaded~on~the~right~pages. }
+
+\str_new:N \g__pdfcc_engine_str
+\sys_if_engine_pdftex:T { \str_gset:Nn \g__pdfcc_engine_str { pdftex } }
+\sys_if_engine_luatex:T { \str_gset:Nn \g__pdfcc_engine_str { luatex } }
+\sys_if_engine_xetex:T  { \str_gset:Nn \g__pdfcc_engine_str { xetex } }
+\str_case:VnF \g__pdfcc_engine_str
+  {
+    { pdftex } { \int_compare:nNnF { \tex_pdfoutput:D } > 0 { \msg_critical:nn { pdfcc } { engine } } }
+    { luatex } { \int_compare:nNnF { \tex_directlua:D { tex.sprint(tex.outputmode) } } > 0 { \msg_critical:nn { pdfcc } { engine } } }
+    { xetex } { }
+  }
+  { \msg_critical:nn { pdfcc } { engine } }
+\bool_new:N \g__pdfcc_pdfmanagement_bool
+\IfPDFManagementActiveTF { \bool_gset_true:N \g__pdfcc_pdfmanagement_bool } { }
+\cs_new:Npn \__pdfcc_engine:n #1 { \str_if_eq_p:Vn \g__pdfcc_engine_str {#1} }
+
+\cs_generate_variant:Nn \msg_error:nnn { nnV , nne }
+\cs_generate_variant:Nn \msg_error:nnnn { nnVn }
+\prg_generate_conditional_variant:Nnn \regex_match:nn { nV } { F , TF }
+\cs_generate_variant:Nn \str_set_convert:Nnnn { NeV , NVV }
+\cs_generate_variant:Nn \tl_gput_right:Nn { Ne }
+
+% --------------------------------------------------------------- backend --
+% \__pdfcc_annot:nnn {width}{height}{dict}: widget annotation (sizes in bp)
+% with its lower left corner at the current point.
+\str_case:Vn \g__pdfcc_engine_str
+  {
+    { pdftex }
+      {
+        \cs_new_protected:Npn \__pdfcc_annot:nnn #1#2#3
+          { \tex_pdfannot:D width ~ #1bp ~ height ~ #2bp ~ depth ~ 0bp ~ {#3} }
+        \cs_new_protected:Npn \__pdfcc_catalog:n #1 { \tex_pdfcatalog:D {#1} }
+      }
+    { luatex }
+      {
+        \cs_new_protected:Npn \__pdfcc_annot:nnn #1#2#3
+          { \tex_pdfextension:D annot ~ width ~ #1bp ~ height ~ #2bp ~ depth ~ 0bp ~ {#3} }
+        \cs_new_protected:Npn \__pdfcc_catalog:n #1 { \tex_pdfextension:D catalog {#1} }
+      }
+    { xetex }
+      {
+        \cs_new_protected:Npn \__pdfcc_annot:nnn #1#2#3
+          { \tex_special:D { pdf:ann ~ width ~ #1bp ~ height ~ #2bp ~ depth ~ 0bp ~ << #3 >> } }
+        \cs_new_protected:Npn \__pdfcc_catalog:n #1 { }
+      }
+  }
+\cs_generate_variant:Nn \__pdfcc_annot:nnn { eee }
+\cs_generate_variant:Nn \__pdfcc_catalog:n { e }
+
+% Objects (l3pdf). pdfTeX and LuaTeX write them at once; dvipdfmx reads
+% specials only from shipped pages, so with XeTeX they wait for the next page.
+% (object names are expanded: they contain the instance name)
+\cs_new:Npn \__pdfcc_ref:n #1 { \exp_args:Ne \pdf_object_ref:n {#1} }
+\cs_new_protected:Npn \__pdfcc_new:n #1 { \exp_args:Ne \pdf_object_new:n {#1} }
+\tl_new:N \g__pdfcc_queue_tl
+\cs_new_protected:Npn \__pdfcc_write:nnn #1#2#3
+  {
+    \bool_if:nTF { \__pdfcc_engine:n { xetex } }
+      { \tl_gput_right:Ne \g__pdfcc_queue_tl { \exp_not:N \pdf_object_write:nnn {#1} {#2} { \exp_not:n {#3} } } }
+      { \exp_args:Ne \pdf_object_write:nnn {#1} {#2} {#3} }
+  }
+\cs_generate_variant:Nn \__pdfcc_write:nnn { nne }
+\cs_new_protected:Npn \__pdfcc_special_later:n #1
+  { \tl_gput_right:Nn \g__pdfcc_queue_tl { \tex_special:D {#1} } }
+\cs_generate_variant:Nn \__pdfcc_special_later:n { e }
+\hook_gput_code:nnn { shipout / background } { pdfcc }
+  {
+    \tl_if_empty:NF \g__pdfcc_queue_tl
+      {
+        \tl_use:N \g__pdfcc_queue_tl
+        \tl_gclear:N \g__pdfcc_queue_tl
+      }
+  }
+
+% --------------------------------------------------------------- helpers --
+\fp_new:N \l__pdfcc_s_fp      % scale factor of the component being built
+\tl_new:N \l__pdfcc_tmp_tl
+\tl_new:N \l__pdfcc_tmpa_tl
+\tl_new:N \l__pdfcc_tmpb_tl
+\str_new:N \l__pdfcc_tmp_str
+\cs_new:Npn \__pdfcc_n:n #1 { \fp_eval:n { round ( #1 , 3 ) } }   % number for PDF and TeX
+% value in bp: bare numbers are bp, anything else is a TeX dimension
+\cs_new_protected:Npn \__pdfcc_bp:nN #1#2
+  {
+    \tl_set:Ne #2 {#1}
+    \regex_match:nVTF { \A\s*[0-9.]+\s*\Z } #2
+      { \tl_set:Ne #2 { \fp_eval:n {#2} } }
+      { \tl_set:Ne #2 { \dim_to_decimal_in_bp:n {#2} } }
+  }
+\cs_new_protected:Npn \__pdfcc_put:nnn #1#2#3   % material at (x, y) bp from the lower left
+  {
+    \hbox_overlap_right:n
+      { \skip_horizontal:n { #1 bp } \box_move_up:nn { #2 bp } { \hbox:n {#3} } }
+  }
+\cs_new_protected:Npn \__pdfcc_size:nn #1#2     % gives the box being built its size
+  { \hbox_to_wd:nn { #1 bp } { \tex_vrule:D width ~ 0pt ~ height ~ #2 bp ~ depth ~ 0pt \tex_hfil:D } }
+\cs_new_protected:Npn \__pdfcc_rect:nnnnn #1#2#3#4#5  % x y w h color: filled rectangle
+  {
+    \__pdfcc_put:nnn {#1} {#2}
+      {
+        \color_group_begin:
+          \color_select:n {#5}
+          \tex_vrule:D width ~ #3 bp ~ height ~ #4 bp ~ depth ~ 0pt
+        \color_group_end:
+      }
+  }
+\cs_generate_variant:Nn \__pdfcc_rect:nnnnn { nnnnV }
+\cs_new_protected:Npn \__pdfcc_frame:nnnnnn #1#2#3#4#5#6  % x y w h line color
+  {
+    \__pdfcc_rect:nnnnn {#1} {#2} {#3} {#5} {#6}
+    \__pdfcc_rect:nnnnn {#1} { \__pdfcc_n:n { #2 + #4 - #5 } } {#3} {#5} {#6}
+    \__pdfcc_rect:nnnnn {#1} {#2} {#5} {#4} {#6}
+    \__pdfcc_rect:nnnnn { \__pdfcc_n:n { #1 + #3 - #5 } } {#2} {#5} {#4} {#6}
+  }
+% PDF text string from TeX text: hex UTF-16BE with BOM
+\str_new:N \g__pdfcc_input_enc_str
+\bool_if:nT { \__pdfcc_engine:n { pdftex } } { \str_gset:Nn \g__pdfcc_input_enc_str { utf8 } }
+\cs_new_protected:Npn \__pdfcc_hex:nN #1#2
+  { \str_set_convert:NeVn #2 { \text_purify:n {#1} } \g__pdfcc_input_enc_str { utf16/hex } }
+
+% ------------------------------------------------------------------ keys --
+% One key tree for three levels: \pdfccdeclare (written by pdf2sty.py),
+% \pdfccload (an instance) and the placement commands. Values go into
+% \l__pdfcc_p_prop under group/key.
+\prop_new:N \l__pdfcc_p_prop
+\bool_new:N \l__pdfcc_placing_bool
+\tl_new:N \l__pdfcc_name_tl     % instance name
+\tl_new:N \l__pdfcc_id_tl       % pdfcc_NAME: JavaScript object and field prefix
+\tl_new:N \l__pdfcc_prog_tl
+\cs_new_protected:Npn \__pdfcc_store:nn #1#2 { \prop_put:Nnn \l__pdfcc_p_prop {#1} {#2} }
+\cs_generate_variant:Nn \__pdfcc_store:nn { ne }
+\cs_new_protected:Npn \__pdfcc_store_load:nn #1#2
+  {
+    \bool_if:NTF \l__pdfcc_placing_bool
+      { \msg_warning:nnn { pdfcc } { load-only } {#1} }
+      { \__pdfcc_store:nn {#1} {#2} }
+  }
+\cs_generate_variant:Nn \__pdfcc_store_load:nn { nV }
+\cs_new_protected:Npn \__pdfcc_group:nn #1#2   % terminal = false | true | {keys}
+  {
+    \str_case:nnF {#2}
+      {
+        { false } { \__pdfcc_store:nn {#1} { false } }
+        { true }  { \__pdfcc_store:nn {#1} { true } }
+      }
+      { \__pdfcc_store:nn {#1} { true } \keys_set:nn { pdfcc / #1 } {#2} }
+  }
+\cs_new_protected:Npn \__pdfcc_def_keys:nnn #1#2#3  % group, keys, keys only for \pdfccload
+  {
+    \clist_map_inline:nn {#2}
+      { \keys_define:nn { pdfcc / #1 } { ##1 .code:n = \__pdfcc_store:nn { #1 / ##1 } {####1} } }
+    \clist_map_inline:nn {#3}
+      { \keys_define:nn { pdfcc / #1 } { ##1 .code:n = \__pdfcc_store_load:nn { #1 / ##1 } {####1} } }
+  }
+\__pdfcc_def_keys:nnn { terminal } { fontsize, width, theme, background, color } { cols, rows, echo }
+\__pdfcc_def_keys:nnn { display } { scale, width, aspect, frame } { cols, rows, mode, dither, gamma }
+\__pdfcc_def_keys:nnn { grid } { } { cols, rows }
+\__pdfcc_def_keys:nnn { keyboard } { width, height, fontsize } { placeholder-hex }
+\__pdfcc_def_keys:nnn { buttons } { cell, fontsize } { }
+\clist_map_inline:nn
+  { js, title, subtitle, help, footer, button-list, fit, scale, width, height, fontsize, show, controls, key, id }
+  { \keys_define:nn { pdfcc } { #1 .code:n = \__pdfcc_store:nn {#1} {##1} } }
+\clist_map_inline:nn { args, pages, load }
+  { \keys_define:nn { pdfcc } { #1 .code:n = \__pdfcc_store_load:nn {#1} {##1} } }
+\keys_define:nn { pdfcc / keyboard }
+  {
+    placeholder .code:n =
+      {
+        \__pdfcc_hex:nN {#1} \l__pdfcc_tmp_str
+        \__pdfcc_store_load:nV { keyboard/placeholder-hex } \l__pdfcc_tmp_str
+      }
+  }
+\keys_define:nn { pdfcc }
+  {
+    terminal .code:n = \__pdfcc_group:nn { terminal } {#1},
+    display  .code:n = \__pdfcc_group:nn { display } {#1},
+    grid     .code:n = \__pdfcc_group:nn { grid } {#1},
+    keyboard .code:n = \__pdfcc_group:nn { keyboard } {#1},
+    buttons  .code:n = \__pdfcc_group:nn { buttons } {#1},
+    name     .code:n = \bool_if:NTF \l__pdfcc_placing_bool
+                         { \msg_warning:nnn { pdfcc } { load-only } { name } }
+                         { \tl_set:Ne \l__pdfcc_name_tl {#1} },
+    program  .code:n = { },
+  }
+\keys_define:nn { pdfcc / find }
+  {
+    program .tl_set:N = \l__pdfcc_prog_tl,
+    unknown .code:n = { },
+  }
+\cs_new:Npn \__pdfcc_get:n #1 { \prop_item:Nn \l__pdfcc_p_prop {#1} }
+\prg_new_conditional:Npnn \__pdfcc_if_on:n #1 { p , T , F , TF }
+  { \str_if_eq:eeTF { \__pdfcc_get:n {#1} } { true } \prg_return_true: \prg_return_false: }
+\prg_new_conditional:Npnn \__pdfcc_if_set:n #1 { p , T , F , TF }
+  { \prop_if_in:NnTF \l__pdfcc_p_prop {#1} \prg_return_true: \prg_return_false: }
+\prg_new_conditional:Npnn \__pdfcc_if_is:nn #1#2 { p , T , F , TF }
+  { \str_if_eq:eeTF { \__pdfcc_get:n {#1} } {#2} \prg_return_true: \prg_return_false: }
+
+% ------------------------------------------------------------ declaration --
+\NewDocumentCommand \pdfccdeclare { m m }
+  {
+    \group_begin:
+      \bool_set_false:N \l__pdfcc_placing_bool
+      \prop_clear:N \l__pdfcc_p_prop
+      \keys_set:nn { pdfcc } {#2}
+      \prop_gclear_new:c { g__pdfcc_p_#1_prop }
+      \prop_gset_eq:cN { g__pdfcc_p_#1_prop } \l__pdfcc_p_prop
+    \group_end:
+  }
+
+% ------------------------------------------------------------- instances --
+\seq_new:N \g__pdfcc_instances_seq
+\tl_new:N \g__pdfcc_last_tl
+\seq_new:N \g__pdfcc_fields_seq          % refs of all parent fields
+\bool_new:N \g__pdfcc_shared_bool
+\bool_new:N \g__pdfcc_hyform_bool        % classic hyperref Form environment seen
+\tl_new:N \l__pdfcc_cfg_tl
+\str_new:N \l__pdfcc_cfg_str
+
+% In the preamble the PDF backend is not loaded yet: load at \begin{document}.
+\bool_new:N \g__pdfcc_document_bool
+\hook_gput_code:nnn { begindocument } { pdfcc } { \bool_gset_true:N \g__pdfcc_document_bool }
+\NewDocumentCommand \pdfccload { O{} m }
+  {
+    \bool_if:NTF \g__pdfcc_document_bool
+      { \__pdfcc_load_cmd:nn {#1} {#2} }
+      { \hook_gput_code:nnn { begindocument } { pdfcc } { \__pdfcc_load_cmd:nn {#1} {#2} } }
+  }
+\cs_new_protected:Npn \__pdfcc_load_cmd:nn #1#2
+  {
+    \group_begin:
+      \bool_set_false:N \l__pdfcc_placing_bool
+      \prop_if_exist:cF { g__pdfcc_p_#2_prop }
+        {
+          \file_if_exist:nTF { pdfcc-#2.tex }
+            { \file_input:n { pdfcc-#2.tex } }
+            { \msg_error:nne { pdfcc } { no-file } { pdfcc-#2.tex } }
+        }
+      \prop_if_exist:cT { g__pdfcc_p_#2_prop } { \__pdfcc_load:nn {#1} {#2} }
+    \group_end:
+  }
+
+\cs_new_protected:Npn \__pdfcc_load:nn #1#2
+  {
+    \prop_set_eq:Nc \l__pdfcc_p_prop { g__pdfcc_p_#2_prop }
+    \tl_set:Nn \l__pdfcc_name_tl {#2}
+    \keys_set:nn { pdfcc } {#1}
+    \__pdfcc_store:nn { prog } {#2}
+    \regex_match:nVF { \A[a-z0-9]+\Z } \l__pdfcc_name_tl
+      { \msg_error:nnV { pdfcc } { bad-name } \l__pdfcc_name_tl }
+    \seq_if_in:NVTF \g__pdfcc_instances_seq \l__pdfcc_name_tl
+      { \msg_error:nnV { pdfcc } { duplicate } \l__pdfcc_name_tl }
+      {
+        \tl_set:Ne \l__pdfcc_id_tl { pdfcc_ \l__pdfcc_name_tl }
+        \clist_map_inline:nn { terminal, display, keyboard, grid }
+          { \__pdfcc_if_set:nF {##1} { \__pdfcc_store:nn {##1} { false } } }
+        \exp_args:Ne \tl_if_blank:nTF { \__pdfcc_get:n { button-list } }
+          { \__pdfcc_store:nn { buttons } { false } }
+          { \__pdfcc_if_set:nF { buttons } { \__pdfcc_store:nn { buttons } { true } } }
+        \clist_map_inline:nn { terminal, display, keyboard, buttons, grid }
+          { \__pdfcc_store:ne { has/##1 } { \__pdfcc_get:n {##1} } }
+        \__pdfcc_shared:
+        \pdf_object_if_exist:nF { pdfcc/js/#2 }
+          { \__pdfcc_file_object:nn { pdfcc/js/#2 } { \__pdfcc_get:n { js } } }
+        \__pdfcc_fields:
+        \__pdfcc_chain:
+        \prop_gclear_new:c { g__pdfcc_i_ \l__pdfcc_name_tl _prop }
+        \prop_gset_eq:cN { g__pdfcc_i_ \l__pdfcc_name_tl _prop } \l__pdfcc_p_prop
+        \seq_gput_right:NV \g__pdfcc_instances_seq \l__pdfcc_name_tl
+        \tl_gset_eq:NN \g__pdfcc_last_tl \l__pdfcc_name_tl
+      }
+  }
+
+% Fonts, the runtime and (XeTeX without pdfmanagement) the AcroForm: once.
+\cs_new_protected:Npn \__pdfcc_shared:
+  {
+    \bool_if:NF \g__pdfcc_shared_bool
+      {
+        \bool_gset_true:N \g__pdfcc_shared_bool
+        \clist_map_inline:nn { Helv/Helvetica, Cour/Courier, CoBo/Courier-Bold }
+          { \__pdfcc_font:w ##1 \q_stop }
+        \__pdfcc_file_object:nn { pdfcc/runtime } { pdfcc-runtime.js }
+        \bool_if:NTF \g__pdfcc_pdfmanagement_bool
+          {
+            \clist_map_inline:nn { Helv, Cour, CoBo }
+              {
+                \use:e
+                  {
+                    \exp_not:N \pdfmanagement_add:nnn { Catalog/AcroForm/DR/Font } {##1}
+                      { \__pdfcc_ref:n { pdfcc/##1 } }
+                  }
+              }
+          }
+          {
+            \bool_if:nT { \__pdfcc_engine:n { xetex } }
+              {
+                \bool_if:NTF \g__pdfcc_hyform_bool
+                  { \__pdfcc_xetex_hyperref_dr: }
+                  { \__pdfcc_xetex_acroform: }
+              }
+          }
+      }
+  }
+\cs_new_protected:Npn \__pdfcc_font:w #1/#2 \q_stop
+  {
+    \__pdfcc_new:n { pdfcc/#1 }
+    \__pdfcc_write:nnn { pdfcc/#1 } { dict }
+      { /Type/Font/Subtype/Type1/BaseFont/#2/Encoding/WinAnsiEncoding }
+  }
+\cs_new:Npn \__pdfcc_dr_fonts:
+  { /Cour ~ \__pdfcc_ref:n { pdfcc/Cour } ~ /CoBo ~ \__pdfcc_ref:n { pdfcc/CoBo } }
+\cs_new_protected:Npn \__pdfcc_file_object:nn #1#2
+  {
+    \file_get_full_name:nNF {#2} \l__pdfcc_tmp_str
+      { \msg_error:nnn { pdfcc } { no-file } {#2} \str_set:Nn \l__pdfcc_tmp_str {#2} }
+    \__pdfcc_new:n {#1}
+    \__pdfcc_write:nne {#1} { fstream } { { } { \l__pdfcc_tmp_str } }
+  }
+
+% Parent fields: one per terminal row, display row and the keyboard.
+\cs_new_protected:Npn \__pdfcc_field:nn #1#2  % object name, dict
+  {
+    \__pdfcc_new:n {#1}
+    \__pdfcc_write:nne {#1} { dict } {#2}
+    \__pdfcc_add_field:e { \__pdfcc_ref:n {#1} }
+  }
+\cs_new_protected:Npn \__pdfcc_fields:
+  {
+    \__pdfcc_if_on:nT { terminal }
+      {
+        \int_step_inline:nn { \__pdfcc_get:n { terminal/rows } }
+          {
+            \__pdfcc_field:nn { pdfcc/ \l__pdfcc_name_tl /tty/##1 }
+              { /T ( \l__pdfcc_id_tl _tty_ \int_eval:n { ##1 - 1 } ) /FT/Tx/Ff ~ 1 /V () }
+          }
+      }
+    \__pdfcc_if_on:nT { display }
+      {
+        \int_step_inline:nn { \__pdfcc_get:n { display/rows } }
+          {
+            \__pdfcc_field:nn { pdfcc/ \l__pdfcc_name_tl /px/##1 }
+              {
+                /T ( \l__pdfcc_id_tl _px_ \int_eval:n { ##1 - 1 } ) /FT/Tx /V ()
+                \__pdfcc_if_is:nnTF { display/mode } { quality }
+                  { /Ff ~ 16777217 /MaxLen ~ \__pdfcc_get:n { display/cols } }
+                  { /Ff ~ 1 }
+              }
+          }
+      }
+    \__pdfcc_if_on:nT { keyboard }
+      {
+        \__pdfcc_field:nn { pdfcc/ \l__pdfcc_name_tl /kbd }
+          {
+            /T ( \l__pdfcc_id_tl _kbd ) /FT/Tx/Ff ~ 4096
+            /V < \__pdfcc_get:n { keyboard/placeholder-hex } > /DA (/Helv~9~Tf~0.35~g)
+            /AA << /K << /S/JavaScript/JS ( \l__pdfcc_id_tl ._key(event) ) >> >>
+          }
+      }
+  }
+
+% /Fields of the AcroForm. pdfmanagement: through it. pdfTeX, LuaTeX: at the
+% end (into hyperref's AcroForm if it writes one). XeTeX: our AcroForm on the
+% next page, or hyperref's once its Form environment was used.
+\cs_new_protected:Npn \__pdfcc_add_field:n #1
+  {
+    \seq_gput_right:Nn \g__pdfcc_fields_seq {#1}
+    \bool_if:NTF \g__pdfcc_pdfmanagement_bool
+      { \pdfmanagement_add:nnn { Catalog/AcroForm } { Fields } {#1} }
+      {
+        \bool_if:nT { \__pdfcc_engine:n { xetex } }
+          {
+            \bool_if:NTF \g__pdfcc_hyform_bool
+              { \tex_special:D { pdf:put ~ @afields ~ #1 } }
+              { \__pdfcc_special_later:e { pdf:put ~ \__pdfcc_ref:n { pdfcc/fields } ~ #1 } }
+          }
+      }
+  }
+\cs_generate_variant:Nn \__pdfcc_add_field:n { e }
+\cs_new_protected:Npn \__pdfcc_xetex_acroform:
+  {
+    \__pdfcc_new:n { pdfcc/fields }
+    \__pdfcc_write:nnn { pdfcc/fields } { array } { }
+    \__pdfcc_new:n { pdfcc/aform }
+    \__pdfcc_write:nne { pdfcc/aform } { dict }
+      {
+        /Fields ~ \__pdfcc_ref:n { pdfcc/fields }
+        /DR << /Font << /Helv ~ \__pdfcc_ref:n { pdfcc/Helv } ~ \__pdfcc_dr_fonts: >> >>
+        /DA (/Helv~0~Tf~0~g)
+      }
+    \__pdfcc_special_later:e { pdf:put ~ @catalog ~ << /AcroForm ~ \__pdfcc_ref:n { pdfcc/aform } >> }
+  }
+\cs_new_protected:Npn \__pdfcc_xetex_hyperref_dr:
+  {
+    \tex_special:D
+      { pdf:put ~ @aform ~ << /DR << /Font << /ZaDb ~ @OBJZaDb ~ /Helv ~ @OBJHelv ~ \__pdfcc_dr_fonts: >> >> >> }
+  }
+% (enddocument/afteraux: before \AtVeryEndDocument code, which is where
+% hyperref writes its AcroForm)
+\hook_gput_code:nnn { enddocument / afteraux } { pdfcc }
+  {
+    \bool_lazy_or:nnF { \g__pdfcc_pdfmanagement_bool } { \__pdfcc_engine:n { xetex } }
+      {
+        \seq_if_empty:NF \g__pdfcc_fields_seq
+          {
+            \bool_if:NTF \g__pdfcc_hyform_bool
+              {
+                % hyperref writes /Fields[\HyField@afields] and /Helv \OBJ@Helv\space 0 R
+                \tl_gput_right:Ne \HyField@afields { ~ \seq_use:Nn \g__pdfcc_fields_seq { ~ } }
+                \tl_gset:Ne \OBJ@Helv
+                  { \OBJ@Helv \c_space_tl 0 ~ R ~ \__pdfcc_dr_fonts: ~ /PdfccHelv ~ \OBJ@Helv }
+              }
+              {
+                \pdf_object_unnamed_write:ne { dict }
+                  {
+                    /Fields [ \seq_use:Nn \g__pdfcc_fields_seq { ~ } ]
+                    /DR << /Font << /Helv ~ \__pdfcc_ref:n { pdfcc/Helv } ~ \__pdfcc_dr_fonts: >> >>
+                    /DA (/Helv~0~Tf~0~g)
+                  }
+                \__pdfcc_catalog:e { /AcroForm ~ \pdf_object_ref_last: }
+              }
+          }
+      }
+  }
+% classic hyperref: notice its Form environment (it writes its own AcroForm)
+\hook_gput_code:nnn { begindocument / end } { pdfcc } { \__pdfcc_wrap_form: }
+\cs_new_protected:Npn \__pdfcc_wrap_form:
+  {
+    \bool_if:NF \g__pdfcc_pdfmanagement_bool
+      {
+        \cs_if_exist:NT \@Form
+          {
+            \cs_gset_eq:NN \__pdfcc_hyperref_form:w \@Form
+            \cs_gset_protected:Npn \@Form [##1]
+              { \__pdfcc_hyperref_form:w [##1] \__pdfcc_hyperref_form: }
+          }
+      }
+  }
+\cs_new_protected:Npn \__pdfcc_hyperref_form:
+  {
+    \bool_if:NF \g__pdfcc_hyform_bool
+      {
+        \bool_gset_true:N \g__pdfcc_hyform_bool
+        % XeTeX: right after hyperref's specials, add ours to its AcroForm
+        \bool_lazy_and:nnT { \__pdfcc_engine:n { xetex } } { \g__pdfcc_shared_bool }
+          {
+            \seq_map_inline:Nn \g__pdfcc_fields_seq { \tex_special:D { pdf:put ~ @afields ~ ##1 } }
+            \__pdfcc_xetex_hyperref_dr:
+          }
+      }
+  }
+
+% Page-open sequence of an instance: config, runtime, program, start. "full"
+% loads the program; "light" (load=first, later pages) only starts it.
+\cs_new:Npn \__pdfcc_js:n #1 { << /S/JavaScript/JS ~ #1 }
+\cs_new_protected:Npn \__pdfcc_chain:
+  {
+    \__pdfcc_config:
+    \tl_gclear_new:c { g__pdfcc_full_ \l__pdfcc_name_tl _tl }
+    \tl_gset:ce { g__pdfcc_full_ \l__pdfcc_name_tl _tl }
+      {
+        \__pdfcc_js:n { < \l__pdfcc_cfg_str > } /Next
+        \__pdfcc_js:n { \__pdfcc_ref:n { pdfcc/runtime } } /Next
+        \__pdfcc_js:n { \__pdfcc_ref:n { pdfcc/js/ \__pdfcc_get:n { prog } } } /Next
+        \__pdfcc_js:n { ( \l__pdfcc_id_tl .start() ) }
+      }
+    \tl_gclear_new:c { g__pdfcc_light_ \l__pdfcc_name_tl _tl }
+    \tl_gset:ce { g__pdfcc_light_ \l__pdfcc_name_tl _tl }
+      {
+        \__pdfcc_js:n { < \l__pdfcc_cfg_str > } /Next
+        \__pdfcc_js:n { \__pdfcc_ref:n { pdfcc/runtime } } /Next
+        \__pdfcc_js:n { ( \l__pdfcc_id_tl .start(PAGE) ) }
+      }
+    \bool_if:nT { \__pdfcc_engine:n { luatex } }
+      {
+        \lua_now:e
+          {
+            pdfcc.add("\l__pdfcc_name_tl",
+              "\lua_escape:e { \tl_use:c { g__pdfcc_full_ \l__pdfcc_name_tl _tl } }",
+              "\lua_escape:e { \tl_use:c { g__pdfcc_light_ \l__pdfcc_name_tl _tl } }",
+              \__pdfcc_if_is:nnTF { pages } { all } { true } { false },
+              \__pdfcc_if_is:nnTF { load } { first } { true } { false })
+          }
+      }
+  }
+% PDFCC_CONFIG for the runtime, as a hex string (UTF-16BE)
+\cs_new_protected:Npn \__pdfcc_config:
+  {
+    \tl_set:Ne \l__pdfcc_cfg_tl
+      {
+        var ~ PDFCC_CONFIG ~ = ~ \c_left_brace_str "name":" \l__pdfcc_id_tl "
+        \__pdfcc_if_on:nT { terminal }
+          {
+            ,"terminal": \c_left_brace_str
+              "cols": \__pdfcc_get:n { terminal/cols } ,
+              "rows": \__pdfcc_get:n { terminal/rows } ,
+              "prefix":" \l__pdfcc_id_tl _tty_"
+              \__pdfcc_if_set:nT { terminal/echo } { ,"echo": \__pdfcc_get:n { terminal/echo } }
+            \c_right_brace_str
+          }
+        \__pdfcc_if_on:nT { display }
+          {
+            ,"display": \c_left_brace_str
+              "cols": \__pdfcc_get:n { display/cols } ,
+              "rows": \__pdfcc_get:n { display/rows } ,
+              "prefix":" \l__pdfcc_id_tl _px_",
+              "mode":" \__pdfcc_get:n { display/mode } ",
+              "dither": \__pdfcc_get:n { display/dither } ,
+              "gamma": \__pdfcc_get:n { display/gamma }
+            \c_right_brace_str
+          }
+        \__pdfcc_if_on:nT { keyboard }
+          { ,"keyboard": \c_left_brace_str "field":" \l__pdfcc_id_tl _kbd" \c_right_brace_str }
+        \__pdfcc_if_set:nT { args }
+          { ,"args":[ \exp_args:Ne \__pdfcc_args:n { \__pdfcc_get:n { args } } ] }
+        \c_right_brace_str ;
+      }
+    \str_set_convert:NVVn \l__pdfcc_cfg_str \l__pdfcc_cfg_tl \g__pdfcc_input_enc_str { utf16/hex }
+  }
+% clist -> JSON strings: "a","b"
+\cs_new:Npn \__pdfcc_args:n #1
+  { \exp_last_unbraced:Ne \use_none:n { \clist_map_function:nN {#1} \__pdfcc_arg:n } }
+\cs_new:Npn \__pdfcc_arg:n #1 { ,"\str_map_function:nN {#1} \__pdfcc_json_char:N " }
+\str_const:Ne \c__pdfcc_bs_str { \c_backslash_str }
+\str_const:Nn \c__pdfcc_q_str { " }
+\cs_new:Npn \__pdfcc_json_char:N #1
+  {
+    \str_case_e:nnF {#1}
+      {
+        { \c__pdfcc_bs_str } { \c_backslash_str \c_backslash_str }
+        { \c__pdfcc_q_str } { \c_backslash_str " }
+      }
+      {#1}
+  }
+
+% ------------------------------------------------------- page-open actions --
+% Shipped placements are recorded as \pdfcc@page{name}{page} in the .aux
+% (pdfLaTeX, XeLaTeX) or in Lua (LuaLaTeX).
+\prop_new:N \g__pdfcc_prev_prop     % name/page from the last run
+\prop_new:N \g__pdfcc_now_prop      % this run (the .aux read again at the end)
+\bool_new:N \g__pdfcc_aux_end_bool
+\cs_new_protected:cpn { pdfcc@page } #1#2
+  {
+    \bool_if:NTF \g__pdfcc_aux_end_bool
+      { \prop_gput:Nnn \g__pdfcc_now_prop { #1/#2 } { } }
+      {
+        \prop_gput:Nnn \g__pdfcc_prev_prop { #1/#2 } { }
+        \seq_if_exist:cF { g__pdfcc_page_#2_seq } { \seq_new:c { g__pdfcc_page_#2_seq } }
+        \seq_if_in:cnF { g__pdfcc_page_#2_seq } {#1} { \seq_gput_right:cn { g__pdfcc_page_#2_seq } {#1} }
+        \int_if_exist:cF { g__pdfcc_first_#1_int }
+          { \int_new:c { g__pdfcc_first_#1_int } \int_gset:cn { g__pdfcc_first_#1_int } {#2} }
+      }
+  }
+\hook_gput_code:nnn { begindocument } { pdfcc }
+  { \legacy_if:nT { @filesw } { \iow_now:Nn \@auxout { \providecommand \pdfcc@page [2] { } } } }
+\hook_gput_code:nnn { enddocument / afterlastpage } { pdfcc }
+  { \bool_gset_true:N \g__pdfcc_aux_end_bool }
+\bool_new:N \l__pdfcc_changed_bool
+\hook_gput_code:nnn { enddocument / afteraux } { pdfcc } { \__pdfcc_check_pages: }
+\cs_new_protected:Npn \__pdfcc_check_pages:
+  {
+    \bool_lazy_and:nnT { ! \__pdfcc_engine:n { luatex } } { \legacy_if_p:n { @filesw } }
+      {
+        \bool_set_false:N \l__pdfcc_changed_bool
+        \prop_map_inline:Nn \g__pdfcc_now_prop
+          { \prop_if_in:NnF \g__pdfcc_prev_prop {##1} { \bool_set_true:N \l__pdfcc_changed_bool } }
+        \prop_map_inline:Nn \g__pdfcc_prev_prop
+          { \prop_if_in:NnF \g__pdfcc_now_prop {##1} { \bool_set_true:N \l__pdfcc_changed_bool } }
+        \bool_if:NT \l__pdfcc_changed_bool { \msg_warning:nn { pdfcc } { rerun } }
+      }
+  }
+
+% marker in a placement: travels with the box, acts when shipped
+\cs_new_protected:Npn \__pdfcc_mark:
+  {
+    \bool_if:nTF { \__pdfcc_engine:n { luatex } }
+      { \use:e { \tex_latelua:D { pdfcc.here("\l__pdfcc_name_tl") } } }
+      {
+        \legacy_if:nT { @filesw }
+          {
+            \exp_args:NNe \iow_shipout_x:Nn \@auxout
+              {
+                \token_to_str:N \pdfcc@page { \l__pdfcc_name_tl }
+                  { \exp_not:N \int_use:N \exp_not:N \g_shipout_readonly_int }
+              }
+          }
+      }
+  }
+
+% pdfLaTeX, XeLaTeX: the action for page #1 from the last run's records
+\tl_new:N \l__pdfcc_chain_tl
+\int_new:N \l__pdfcc_closers_int
+\bool_new:N \l__pdfcc_here_bool
+\tl_new:N \g__pdfcc_saved_attr_tl
+\bool_new:N \g__pdfcc_attr_set_bool
+\cs_new_protected:Npn \__pdfcc_page_chain:n #1
+  {
+    \tl_clear:N \l__pdfcc_chain_tl
+    \int_zero:N \l__pdfcc_closers_int
+    \seq_map_inline:Nn \g__pdfcc_instances_seq
+      {
+        \prop_set_eq:Nc \l__pdfcc_p_prop { g__pdfcc_i_##1_prop }
+        \bool_set:Nn \l__pdfcc_here_bool
+          { \__pdfcc_if_is_p:nn { pages } { all } || ! \int_if_exist_p:c { g__pdfcc_first_##1_int } }
+        \seq_if_exist:cT { g__pdfcc_page_#1_seq }
+          { \seq_if_in:cnT { g__pdfcc_page_#1_seq } {##1} { \bool_set_true:N \l__pdfcc_here_bool } }
+        \bool_if:NT \l__pdfcc_here_bool
+          {
+            \tl_if_empty:NF \l__pdfcc_chain_tl { \tl_put_right:Nn \l__pdfcc_chain_tl { ~ /Next ~ } }
+            \bool_lazy_all:nTF
+              {
+                { \__pdfcc_if_is_p:nn { load } { first } }
+                { ! \__pdfcc_if_is_p:nn { pages } { all } }
+                { \int_if_exist_p:c { g__pdfcc_first_##1_int } }
+                { ! \int_compare_p:nNn { \int_use:c { g__pdfcc_first_##1_int } } = {#1} }
+              }
+              {
+                \tl_set_eq:Nc \l__pdfcc_tmp_tl { g__pdfcc_light_##1_tl }
+                \tl_replace_once:Nne \l__pdfcc_tmp_tl { PAGE } { \int_use:c { g__pdfcc_first_##1_int } }
+                \tl_put_right:NV \l__pdfcc_chain_tl \l__pdfcc_tmp_tl
+                \int_add:Nn \l__pdfcc_closers_int { 3 }
+              }
+              {
+                \tl_put_right:Nv \l__pdfcc_chain_tl { g__pdfcc_full_##1_tl }
+                \int_add:Nn \l__pdfcc_closers_int { 4 }
+              }
+          }
+      }
+    \tl_put_right:Ne \l__pdfcc_chain_tl { \prg_replicate:nn { \l__pdfcc_closers_int } { ~ >> } }
+  }
+\cs_generate_variant:Nn \tl_replace_once:Nnn { Nne }
+
+\str_case:Vn \g__pdfcc_engine_str
+  {
+    { pdftex }
+      {
+        % with pdfmanagement: through its Page dictionary, which it turns into
+        % \pdfpageattr after the background hook
+        \hook_gput_code:nnn { shipout / background } { pdfcc }
+          {
+            \bool_lazy_and:nnT { \g__pdfcc_pdfmanagement_bool } { ! \seq_if_empty_p:N \g__pdfcc_instances_seq }
+              {
+                \__pdfcc_page_chain:n { \int_use:N \g_shipout_readonly_int }
+                \int_compare:nNnT \l__pdfcc_closers_int > 0
+                  {
+                    \use:e { \exp_not:N \pdfmanagement_add:nnn { Page } { AA } { << /O ~ \l__pdfcc_chain_tl >> } }
+                    \bool_gset_true:N \g__pdfcc_attr_set_bool
+                  }
+              }
+          }
+        \hook_gput_code:nnn { shipout / foreground } { pdfcc }
+          {
+            \bool_lazy_and:nnT { ! \g__pdfcc_pdfmanagement_bool } { ! \seq_if_empty_p:N \g__pdfcc_instances_seq }
+              {
+                \__pdfcc_page_chain:n { \int_use:N \g_shipout_readonly_int }
+                \int_compare:nNnT \l__pdfcc_closers_int > 0
+                  {
+                    \tl_gset:No \g__pdfcc_saved_attr_tl { \tex_the:D \tex_pdfpageattr:D }
+                    \bool_gset_true:N \g__pdfcc_attr_set_bool
+                    \tl_set:Ne \l__pdfcc_tmp_tl
+                      { \tex_the:D \tex_pdfpageattr:D \c_space_tl /AA << /O ~ \l__pdfcc_chain_tl >> }
+                    \tex_global:D \tex_pdfpageattr:D \exp_after:wN { \l__pdfcc_tmp_tl }
+                  }
+              }
+          }
+        \hook_gput_code:nnn { shipout / after } { pdfcc }
+          {
+            \bool_if:NT \g__pdfcc_attr_set_bool
+              {
+                \bool_gset_false:N \g__pdfcc_attr_set_bool
+                \bool_if:NTF \g__pdfcc_pdfmanagement_bool
+                  { \pdfmanagement_remove:nn { Page } { AA } }
+                  { \tex_global:D \tex_pdfpageattr:D \exp_after:wN { \g__pdfcc_saved_attr_tl } }
+              }
+          }
+      }
+    { xetex }
+      {
+        \hook_gput_code:nnn { shipout / foreground } { pdfcc }
+          {
+            \seq_if_empty:NF \g__pdfcc_instances_seq
+              {
+                \__pdfcc_page_chain:n { \int_use:N \g_shipout_readonly_int }
+                \int_compare:nNnT \l__pdfcc_closers_int > 0
+                  { \tex_special:D { pdf:put ~ @thispage ~ << /AA << /O ~ \l__pdfcc_chain_tl >> >> } }
+              }
+          }
+      }
+    { luatex }
+      {
+        \hook_gput_code:nnn { shipout / foreground } { pdfcc }
+          { \seq_if_empty:NF \g__pdfcc_instances_seq { \tex_latelua:D { pdfcc.finish() } } }
+        \hook_gput_code:nnn { shipout / after } { pdfcc }
+          { \lua_now:n { pdfcc.restore() } }
+      }
+  }
+
+% ------------------------------------------------------------ placement --
+\bool_new:N \l__pdfcc_ok_bool
+\cs_new_protected:Npn \__pdfcc_place_init:n #1
+  {
+    \bool_set_true:N \l__pdfcc_placing_bool
+    \tl_set_eq:NN \l__pdfcc_prog_tl \g__pdfcc_last_tl
+    \keys_set:nn { pdfcc / find } {#1}
+    \prop_if_exist:cTF { g__pdfcc_i_ \l__pdfcc_prog_tl _prop }
+      {
+        \bool_set_true:N \l__pdfcc_ok_bool
+        \prop_set_eq:Nc \l__pdfcc_p_prop { g__pdfcc_i_ \l__pdfcc_prog_tl _prop }
+        \tl_set_eq:NN \l__pdfcc_name_tl \l__pdfcc_prog_tl
+        \tl_set:Ne \l__pdfcc_id_tl { pdfcc_ \l__pdfcc_name_tl }
+        \keys_set:nn { pdfcc } {#1}
+      }
+      {
+        \bool_set_false:N \l__pdfcc_ok_bool
+        \msg_error:nnV { pdfcc } { no-program } \l__pdfcc_prog_tl
+      }
+  }
+% top-level width/height/fontsize of a single component -> group/key
+\cs_new_protected:Npn \__pdfcc_alias:nn #1#2   % key, group
+  {
+    \__pdfcc_if_set:nT {#1}
+      {
+        \__pdfcc_store:ne { #2/#1 } { \__pdfcc_get:n {#1} }
+        \prop_remove:Nn \l__pdfcc_p_prop {#1}
+      }
+  }
+\cs_new_protected:Npn \__pdfcc_need:nT #1#2
+  {
+    \bool_if:NT \l__pdfcc_ok_bool
+      {
+        \__pdfcc_if_on:nTF { has/#1 } {#2}
+          { \msg_error:nnVn { pdfcc } { no-component } \l__pdfcc_name_tl {#1} }
+      }
+  }
+\fp_new:N \l__pdfcc_avail_fp     % width available for fitting (bp)
+\cs_new_protected:Npn \__pdfcc_avail:
+  {
+    \__pdfcc_if_set:nTF { width }
+      { \__pdfcc_bp:nN { \__pdfcc_get:n { width } } \l__pdfcc_tmp_tl }
+      { \tl_set:Ne \l__pdfcc_tmp_tl { \dim_to_decimal_in_bp:n { \linewidth } } }
+    \fp_set:Nn \l__pdfcc_avail_fp { \l__pdfcc_tmp_tl }
+  }
+% scale: explicit, or the largest that fits the line (at most 1)
+\cs_new_protected:Npn \__pdfcc_scale:n #1   % natural width (bp)
+  {
+    \__pdfcc_if_set:nTF { scale }
+      { \fp_set:Nn \l__pdfcc_s_fp { \__pdfcc_get:n { scale } } }
+      {
+        \__pdfcc_avail:
+        \bool_lazy_and:nnTF
+          { ! \__pdfcc_if_is_p:nn { fit } { false } }
+          { \fp_compare_p:nNn {#1} > \l__pdfcc_avail_fp }
+          { \fp_set:Nn \l__pdfcc_s_fp { \l__pdfcc_avail_fp / (#1) } }
+          { \fp_set:Nn \l__pdfcc_s_fp { 1 } }
+      }
+  }
+
+% ---- terminal: rows x cols text fields, Courier
+\fp_new:N \l__pdfcc_fs_fp
+\fp_new:N \l__pdfcc_w_fp
+\fp_new:N \l__pdfcc_h_fp
+\tl_new:N \l__pdfcc_bg_tl
+\tl_new:N \l__pdfcc_fg_tl
+\box_new:N \l__pdfcc_term_box
+\box_new:N \l__pdfcc_disp_box
+\box_new:N \l__pdfcc_kbd_box
+\box_new:N \l__pdfcc_btn_box
+\box_new:N \l__pdfcc_ctl_box
+\cs_new_protected:Npn \__pdfcc_term_measure:   % natural width -> w; font size -> fs
+  {
+    \__pdfcc_if_set:nTF { terminal/width }
+      {
+        \__pdfcc_bp:nN { \__pdfcc_get:n { terminal/width } } \l__pdfcc_tmp_tl
+        \fp_set:Nn \l__pdfcc_fs_fp { ( \l__pdfcc_tmp_tl - 12 ) / ( 0.6 * \__pdfcc_get:n { terminal/cols } ) }
+      }
+      {
+        \__pdfcc_bp:nN { \__pdfcc_get:n { terminal/fontsize } } \l__pdfcc_tmp_tl
+        \fp_set:Nn \l__pdfcc_fs_fp { \l__pdfcc_tmp_tl }
+      }
+    \fp_set:Nn \l__pdfcc_w_fp { \__pdfcc_get:n { terminal/cols } * 0.6 * \l__pdfcc_fs_fp + 12 }
+  }
+\cs_new_protected:Npn \__pdfcc_term_box:N #1   % at scale \l__pdfcc_s_fp
+  {
+    \__pdfcc_term_measure:
+    \fp_set:Nn \l__pdfcc_fs_fp { \l__pdfcc_fs_fp * \l__pdfcc_s_fp }
+    \tl_set:Ne \l__pdfcc_tmpa_tl { \__pdfcc_n:n { \l__pdfcc_fs_fp * 1.2 } }      % line height
+    \tl_set:Ne \l__pdfcc_tmpb_tl { \__pdfcc_n:n { 4 * \l__pdfcc_s_fp } }         % padding
+    \fp_set:Nn \l__pdfcc_w_fp { \__pdfcc_get:n { terminal/cols } * 0.6 * \l__pdfcc_fs_fp + 3 * \l__pdfcc_tmpb_tl }
+    \fp_set:Nn \l__pdfcc_h_fp { \__pdfcc_get:n { terminal/rows } * \l__pdfcc_tmpa_tl + 2 * \l__pdfcc_tmpb_tl }
+    \__pdfcc_if_is:nnTF { terminal/theme } { dark }
+      { \tl_set:Nn \l__pdfcc_bg_tl { black!92 } \tl_set:Nn \l__pdfcc_fg_tl { green!45!white } }
+      { \tl_set:Nn \l__pdfcc_bg_tl { black!4 } \tl_set:Nn \l__pdfcc_fg_tl { black!90 } }
+    \__pdfcc_if_set:nT { terminal/background } { \tl_set:Ne \l__pdfcc_bg_tl { \__pdfcc_get:n { terminal/background } } }
+    \__pdfcc_if_set:nT { terminal/color } { \tl_set:Ne \l__pdfcc_fg_tl { \__pdfcc_get:n { terminal/color } } }
+    \exp_args:NV \color_export:nnN \l__pdfcc_fg_tl { space-sep-rgb } \l__pdfcc_fg_tl
+    \hbox_set:Nn #1
+      {
+        \__pdfcc_mark:
+        \__pdfcc_rect:nnnnV { 0 } { 0 } { \__pdfcc_n:n { \l__pdfcc_w_fp } } { \__pdfcc_n:n { \l__pdfcc_h_fp } }
+          \l__pdfcc_bg_tl
+        \int_step_inline:nn { \__pdfcc_get:n { terminal/rows } }
+          {
+            \__pdfcc_put:nnn { \l__pdfcc_tmpb_tl }
+              { \__pdfcc_n:n { \l__pdfcc_h_fp - \l__pdfcc_tmpb_tl - ##1 * \l__pdfcc_tmpa_tl } }
+              {
+                \__pdfcc_annot:eee { \__pdfcc_n:n { \l__pdfcc_w_fp - 2 * \l__pdfcc_tmpb_tl } } { \l__pdfcc_tmpa_tl }
+                  {
+                    /Subtype/Widget/F ~ 4 /BS << /W ~ 0 >>
+                    /Parent ~ \__pdfcc_ref:n { pdfcc/ \l__pdfcc_name_tl /tty/##1 }
+                    /DA (/Cour ~ \__pdfcc_n:n { \l__pdfcc_fs_fp } ~ Tf ~ \l__pdfcc_fg_tl \c_space_tl rg)
+                  }
+              }
+          }
+        \__pdfcc_size:nn { \__pdfcc_n:n { \l__pdfcc_w_fp } } { \__pdfcc_n:n { \l__pdfcc_h_fp } }
+      }
+  }
+
+% ---- display: one text field per pixel row; Courier-Bold glyphs are the shades
+\fp_new:N \l__pdfcc_pw_fp
+\cs_new_protected:Npn \__pdfcc_disp_measure:
+  {
+    \__pdfcc_if_set:nTF { display/width }
+      {
+        \__pdfcc_bp:nN { \__pdfcc_get:n { display/width } } \l__pdfcc_tmp_tl
+        \fp_set:Nn \l__pdfcc_pw_fp { \l__pdfcc_tmp_tl / \__pdfcc_get:n { display/cols } }
+      }
+      {
+        \__pdfcc_bp:nN { \__pdfcc_get:n { display/scale } } \l__pdfcc_tmp_tl
+        \fp_set:Nn \l__pdfcc_pw_fp { \l__pdfcc_tmp_tl }
+      }
+    \fp_set:Nn \l__pdfcc_w_fp { \__pdfcc_get:n { display/cols } * \l__pdfcc_pw_fp }
+  }
+\cs_new_protected:Npn \__pdfcc_disp_box:N #1
+  {
+    \__pdfcc_disp_measure:
+    \fp_set:Nn \l__pdfcc_pw_fp { \l__pdfcc_pw_fp * \l__pdfcc_s_fp }
+    \tl_set:Ne \l__pdfcc_tmpa_tl { \__pdfcc_n:n { \l__pdfcc_pw_fp * \__pdfcc_get:n { display/aspect } } } % row height
+    \fp_set:Nn \l__pdfcc_w_fp { \__pdfcc_get:n { display/cols } * \l__pdfcc_pw_fp }
+    \fp_set:Nn \l__pdfcc_h_fp { \__pdfcc_get:n { display/rows } * \l__pdfcc_tmpa_tl }
+    \fp_set:Nn \l__pdfcc_fs_fp
+      { \l__pdfcc_pw_fp / 0.6 * \__pdfcc_if_is:nnTF { display/mode } { quality } { 1.7 } { 0.995 } }
+    \hbox_set:Nn #1
+      {
+        \__pdfcc_mark:
+        \__pdfcc_if_is:nnF { display/frame } { false }
+          {
+            \__pdfcc_frame:nnnnnn { -1 } { -1 } { \__pdfcc_n:n { \l__pdfcc_w_fp + 2 } }
+              { \__pdfcc_n:n { \l__pdfcc_h_fp + 2 } } { 0.5 } { black!20 }
+          }
+        \int_step_inline:nn { \__pdfcc_get:n { display/rows } }
+          {
+            \__pdfcc_put:nnn { 0 } { \__pdfcc_n:n { \l__pdfcc_h_fp - ##1 * \l__pdfcc_tmpa_tl } }
+              {
+                \__pdfcc_annot:eee { \__pdfcc_n:n { \l__pdfcc_w_fp } } { \l__pdfcc_tmpa_tl }
+                  {
+                    /Subtype/Widget/F ~ 4 /BS << /W ~ 0 >>
+                    /Parent ~ \__pdfcc_ref:n { pdfcc/ \l__pdfcc_name_tl /px/##1 }
+                    /DA (/CoBo ~ \__pdfcc_n:n { \l__pdfcc_fs_fp } ~ Tf ~ 0 ~ g)
+                  }
+              }
+          }
+        \bool_lazy_and:nnT { \__pdfcc_if_on_p:n { has/grid } } { ! \__pdfcc_if_is_p:nn { grid } { false } }
+          { \__pdfcc_grid: }
+        \__pdfcc_size:nn { \__pdfcc_n:n { \l__pdfcc_w_fp } } { \__pdfcc_n:n { \l__pdfcc_h_fp } }
+      }
+  }
+\cs_new_protected:Npn \__pdfcc_grid:   % clickable cells over the display
+  {
+    \tl_set:Ne \l__pdfcc_tmpa_tl { \__pdfcc_n:n { \l__pdfcc_w_fp / \__pdfcc_get:n { grid/cols } } }
+    \tl_set:Ne \l__pdfcc_tmpb_tl { \__pdfcc_n:n { \l__pdfcc_h_fp / \__pdfcc_get:n { grid/rows } } }
+    \int_step_inline:nnn { 0 } { \__pdfcc_get:n { grid/rows } - 1 }
+      {
+        \int_step_inline:nnn { 0 } { \__pdfcc_get:n { grid/cols } - 1 }
+          {
+            \__pdfcc_put:nnn { \__pdfcc_n:n { ####1 * \l__pdfcc_tmpa_tl } }
+              { \__pdfcc_n:n { \l__pdfcc_h_fp - ( ##1 + 1 ) * \l__pdfcc_tmpb_tl } }
+              {
+                \__pdfcc_annot:eee { \l__pdfcc_tmpa_tl } { \l__pdfcc_tmpb_tl }
+                  {
+                    /Subtype/Widget/FT/Btn/Ff ~ 65536 /F ~ 4 /BS << /W ~ 0 >> /MK << >>
+                    /T ( \l__pdfcc_id_tl _grid_ ####1 _ ##1 )
+                    /AA << /D ~ \__pdfcc_js:n { ( \l__pdfcc_id_tl ._gridClick(event,1) ) } >>
+                           /U ~ \__pdfcc_js:n { ( \l__pdfcc_id_tl ._gridClick(event,0) ) } >> >>
+                  }
+              }
+          }
+      }
+  }
+
+% ---- keyboard: a multiline text field; its keystrokes go to the program
+\cs_new_protected:Npn \__pdfcc_kbd_measure:n #1   % default width -> tmpa (w), tmpb (h)
+  {
+    \__pdfcc_if_set:nTF { keyboard/width }
+      { \__pdfcc_bp:nN { \__pdfcc_get:n { keyboard/width } } \l__pdfcc_tmpa_tl }
+      { \tl_set:Ne \l__pdfcc_tmpa_tl {#1} }
+    \__pdfcc_if_set:nTF { keyboard/height }
+      { \__pdfcc_bp:nN { \__pdfcc_get:n { keyboard/height } } \l__pdfcc_tmpb_tl }
+      { \tl_set:Nn \l__pdfcc_tmpb_tl { 34 } }
+  }
+\cs_new_protected:Npn \__pdfcc_kbd_box:Nn #1#2   % box, default width (bp)
+  {
+    \__pdfcc_kbd_measure:n {#2}
+    \__pdfcc_if_set:nTF { keyboard/fontsize }
+      { \__pdfcc_bp:nN { \__pdfcc_get:n { keyboard/fontsize } } \l__pdfcc_tmp_tl }
+      { \tl_set:Nn \l__pdfcc_tmp_tl { 9 } }
+    \tl_set:Ne \l__pdfcc_tmpa_tl { \__pdfcc_n:n { \l__pdfcc_tmpa_tl * \l__pdfcc_s_fp } }
+    \tl_set:Ne \l__pdfcc_tmpb_tl { \__pdfcc_n:n { \l__pdfcc_tmpb_tl * \l__pdfcc_s_fp } }
+    \tl_set:Ne \l__pdfcc_tmp_tl { \__pdfcc_n:n { \l__pdfcc_tmp_tl * \l__pdfcc_s_fp } }
+    \hbox_set:Nn #1
+      {
+        \__pdfcc_mark:
+        \__pdfcc_frame:nnnnnn { 0 } { 0 } { \l__pdfcc_tmpa_tl } { \l__pdfcc_tmpb_tl } { 0.75 } { black!40 }
+        \__pdfcc_annot:eee { \l__pdfcc_tmpa_tl } { \l__pdfcc_tmpb_tl }
+          {
+            /Subtype/Widget/F ~ 4 /BS << /W ~ 0 >>
+            /Parent ~ \__pdfcc_ref:n { pdfcc/ \l__pdfcc_name_tl /kbd }
+            /DA (/Helv ~ \l__pdfcc_tmp_tl \c_space_tl Tf ~ 0.35 ~ g)
+            /AA << /Fo ~ \__pdfcc_js:n { ( \l__pdfcc_id_tl ._kbdFocus(true) ) } >>
+                   /Bl ~ \__pdfcc_js:n { ( \l__pdfcc_id_tl ._kbdFocus(false) ) } >> >>
+          }
+        \__pdfcc_size:nn { \l__pdfcc_tmpa_tl } { \l__pdfcc_tmpb_tl }
+      }
+  }
+
+% ---- buttons. The program's list: {label hex}{code}{is id}{col}{row}{w}{h}...
+\int_new:N \g__pdfcc_button_int
+\tl_new:N \l__pdfcc_bfs_tl     % button font size
+\cs_new_protected:Npn \__pdfcc_button:nnnnn #1#2#3#4#5  % w h label-hex code is-id
+  {
+    \int_gincr:N \g__pdfcc_button_int
+    \__pdfcc_annot:eee {#1} {#2}
+      {
+        /Subtype/Widget/FT/Btn/Ff ~ 65536 /F ~ 4 /BS << /W ~ 0 >>
+        /T ( \l__pdfcc_id_tl _btn_ \int_use:N \g__pdfcc_button_int )
+        /DA (/Helv ~ \l__pdfcc_bfs_tl \c_space_tl Tf ~ 0 ~ g)
+        /MK << /BG [0.9] /CA <#3> >>
+        /AA << /D ~ \__pdfcc_js:n { ( \l__pdfcc_id_tl ._button( #4 ,1 \int_compare:nNnT {#5} = 1 { ,1 } ) ) } >>
+               /U ~ \__pdfcc_js:n { ( \l__pdfcc_id_tl ._button( #4 ,0 \int_compare:nNnT {#5} = 1 { ,1 } ) ) } >> >>
+      }
+  }
+\fp_new:N \l__pdfcc_c_fp
+\fp_new:N \l__pdfcc_r_fp
+\cs_new_protected:Npn \__pdfcc_btn_map:N #1
+  {
+    \exp_args:NNe \__pdfcc_btn_map_aux:Nw #1
+      { \__pdfcc_get:n { button-list } \exp_not:N \q_recursion_tail {} {} {} {} {} {} \exp_not:N \q_recursion_stop }
+  }
+\cs_new_protected:Npn \__pdfcc_btn_map_aux:Nw #1#2 { \__pdfcc_btn_loop:Nw #1 #2 }
+\cs_new_protected:Npn \__pdfcc_btn_loop:Nw #1#2#3#4#5#6#7#8
+  {
+    \quark_if_recursion_tail_stop:n {#2}
+    #1 {#2} {#3} {#4} {#5} {#6} {#7} {#8}
+    \__pdfcc_btn_loop:Nw #1
+  }
+\cs_new_protected:Npn \__pdfcc_btn_measure:   % grid size in cells -> c, r
+  {
+    \fp_zero:N \l__pdfcc_c_fp
+    \fp_zero:N \l__pdfcc_r_fp
+    \__pdfcc_btn_map:N \__pdfcc_btn_extent:nnnnnnn
+  }
+\cs_new_protected:Npn \__pdfcc_btn_extent:nnnnnnn #1#2#3#4#5#6#7
+  {
+    \fp_set:Nn \l__pdfcc_c_fp { max ( \l__pdfcc_c_fp , #4 + #6 ) }
+    \fp_set:Nn \l__pdfcc_r_fp { max ( \l__pdfcc_r_fp , #5 + #7 ) }
+  }
+\fp_new:N \l__pdfcc_cell_fp
+\cs_new_protected:Npn \__pdfcc_cell:
+  {
+    \__pdfcc_if_set:nTF { buttons/cell }
+      { \__pdfcc_bp:nN { \__pdfcc_get:n { buttons/cell } } \l__pdfcc_tmp_tl }
+      { \tl_set:Nn \l__pdfcc_tmp_tl { 34 } }
+    \fp_set:Nn \l__pdfcc_cell_fp { \l__pdfcc_tmp_tl }
+  }
+\cs_new_protected:Npn \__pdfcc_btn_box:N #1
+  {
+    \__pdfcc_cell:
+    \fp_set:Nn \l__pdfcc_cell_fp { \l__pdfcc_cell_fp * \l__pdfcc_s_fp }
+    \__pdfcc_btn_measure:
+    \__pdfcc_if_set:nTF { buttons/fontsize }
+      {
+        \__pdfcc_bp:nN { \__pdfcc_get:n { buttons/fontsize } } \l__pdfcc_bfs_tl
+        \tl_set:Ne \l__pdfcc_bfs_tl { \__pdfcc_n:n { \l__pdfcc_bfs_tl * \l__pdfcc_s_fp } }
+      }
+      { \tl_set:Ne \l__pdfcc_bfs_tl { \__pdfcc_n:n { 10 * \l__pdfcc_cell_fp / 34 } } }
+    \fp_set:Nn \l__pdfcc_w_fp { \l__pdfcc_c_fp * \l__pdfcc_cell_fp }
+    \fp_set:Nn \l__pdfcc_h_fp { \l__pdfcc_r_fp * \l__pdfcc_cell_fp }
+    \hbox_set:Nn #1
+      {
+        \__pdfcc_mark:
+        \__pdfcc_btn_map:N \__pdfcc_btn_place:nnnnnnn
+        \__pdfcc_size:nn { \__pdfcc_n:n { \l__pdfcc_w_fp } } { \__pdfcc_n:n { \l__pdfcc_h_fp - 4 * \l__pdfcc_s_fp } }
+      }
+  }
+\cs_new_protected:Npn \__pdfcc_btn_place:nnnnnnn #1#2#3#4#5#6#7  % label code is-id col row w h
+  {
+    \__pdfcc_put:nnn { \__pdfcc_n:n { #4 * \l__pdfcc_cell_fp } }
+      { \__pdfcc_n:n { \l__pdfcc_h_fp - ( #5 + #7 ) * \l__pdfcc_cell_fp } }
+      {
+        \__pdfcc_button:nnnnn { \__pdfcc_n:n { #6 * \l__pdfcc_cell_fp - 4 * \l__pdfcc_s_fp } }
+          { \__pdfcc_n:n { #7 * \l__pdfcc_cell_fp - 4 * \l__pdfcc_s_fp } } {#1} {#2} {#3}
+      }
+  }
+% key name -> code in #2 (the codes of tools/mkpdf.py and runtime/pdfcc.h); -1 if unknown
+\cs_new_protected:Npn \__pdfcc_keycode:nN #1#2
+  {
+    \tl_set:Ne #2 {#1}
+    \tl_set:Ne #2
+      {
+        \str_case_e:nnF { #2 }
+          {
+            { UP } { 256 } { DOWN } { 257 } { LEFT } { 258 } { RIGHT } { 259 }
+            { SHIFT } { 260 } { CTRL } { 261 } { ALT } { 262 } { ENTER } { 13 } { RETURN } { 13 }
+            { ESC } { 27 } { ESCAPE } { 27 } { SPACE } { 32 } { TAB } { 9 } { BACKSPACE } { 8 }
+            { F1 } { 272 } { F2 } { 273 } { F3 } { 274 } { F4 } { 275 } { F5 } { 276 } { F6 } { 277 }
+            { F7 } { 278 } { F8 } { 279 } { F9 } { 280 } { F10 } { 281 } { F11 } { 282 } { F12 } { 283 }
+          }
+          { \exp_not:V #2 }
+      }
+    \regex_match:nVF { \A[0-9]+\Z } #2
+      {
+        \int_compare:nNnTF { \str_count:V #2 } = 1
+          { \tl_set:Ne #2 { \int_eval:n { \exp_after:wN ` #2 } } }
+          { \tl_set:Nn #2 { -1 } }
+      }
+  }
+
+\cs_new_protected:Npn \__pdfcc_lines:n #1
+  { \tl_map_inline:nn {#1} { \mode_leave_vertical: ##1 \par } }
+
+% ------------------------------------------------------- user commands --
+\NewDocumentCommand \pdfccterminal { O{} }
+  {
+    \group_begin:
+      \__pdfcc_place_init:n {#1}
+      \__pdfcc_need:nT { terminal }
+        {
+          \__pdfcc_alias:nn { width } { terminal }
+          \__pdfcc_alias:nn { fontsize } { terminal }
+          \__pdfcc_term_measure:
+          \__pdfcc_scale:n { \l__pdfcc_w_fp }
+          \__pdfcc_term_box:N \l__pdfcc_term_box
+          \mode_leave_vertical: \box_use:N \l__pdfcc_term_box
+        }
+    \group_end:
+  }
+\NewDocumentCommand \pdfccdisplay { O{} }
+  {
+    \group_begin:
+      \__pdfcc_place_init:n {#1}
+      \__pdfcc_need:nT { display }
+        {
+          \__pdfcc_alias:nn { width } { display }
+          \__pdfcc_disp_measure:
+          \__pdfcc_scale:n { \l__pdfcc_w_fp }
+          \__pdfcc_disp_box:N \l__pdfcc_disp_box
+          \mode_leave_vertical: \box_use:N \l__pdfcc_disp_box
+        }
+    \group_end:
+  }
+\NewDocumentCommand \pdfcckeyboard { O{} }
+  {
+    \group_begin:
+      \__pdfcc_place_init:n {#1}
+      \__pdfcc_need:nT { keyboard }
+        {
+          \clist_map_inline:nn { width, height, fontsize } { \__pdfcc_alias:nn {##1} { keyboard } }
+          \__pdfcc_kbd_measure:n { 190 }
+          \__pdfcc_scale:n { \l__pdfcc_tmpa_tl }
+          \__pdfcc_kbd_box:Nn \l__pdfcc_kbd_box { 190 }
+          \mode_leave_vertical: \box_use:N \l__pdfcc_kbd_box
+        }
+    \group_end:
+  }
+\NewDocumentCommand \pdfccbuttons { O{} }
+  {
+    \group_begin:
+      \__pdfcc_place_init:n {#1}
+      \__pdfcc_need:nT { buttons }
+        {
+          \__pdfcc_alias:nn { fontsize } { buttons }
+          \__pdfcc_cell:
+          \__pdfcc_btn_measure:
+          \__pdfcc_scale:n { \l__pdfcc_c_fp * \l__pdfcc_cell_fp }
+          \__pdfcc_btn_box:N \l__pdfcc_btn_box
+          \mode_leave_vertical: \box_use:N \l__pdfcc_btn_box
+        }
+    \group_end:
+  }
+% one button anywhere: \pdfccbutton[key=UP]{label} or \pdfccbutton[id=7]{label}
+\tl_new:N \l__pdfcc_code_tl
+\tl_new:N \l__pdfcc_isid_tl
+\NewDocumentCommand \pdfccbutton { O{} m }
+  {
+    \group_begin:
+      \__pdfcc_place_init:n {#1}
+      \bool_if:NT \l__pdfcc_ok_bool
+        {
+          \fp_set:Nn \l__pdfcc_s_fp { \__pdfcc_if_set:nTF { scale } { \__pdfcc_get:n { scale } } { 1 } }
+          \__pdfcc_if_set:nTF { width } { \__pdfcc_bp:nN { \__pdfcc_get:n { width } } \l__pdfcc_tmpa_tl }
+            { \tl_set:Nn \l__pdfcc_tmpa_tl { 30 } }
+          \__pdfcc_if_set:nTF { height } { \__pdfcc_bp:nN { \__pdfcc_get:n { height } } \l__pdfcc_tmpb_tl }
+            { \tl_set:Nn \l__pdfcc_tmpb_tl { 30 } }
+          \__pdfcc_if_set:nTF { fontsize } { \__pdfcc_bp:nN { \__pdfcc_get:n { fontsize } } \l__pdfcc_bfs_tl }
+            { \tl_set:Nn \l__pdfcc_bfs_tl { 10 } }
+          \tl_set:Ne \l__pdfcc_tmpa_tl { \__pdfcc_n:n { \l__pdfcc_tmpa_tl * \l__pdfcc_s_fp } }
+          \tl_set:Ne \l__pdfcc_tmpb_tl { \__pdfcc_n:n { \l__pdfcc_tmpb_tl * \l__pdfcc_s_fp } }
+          \tl_set:Ne \l__pdfcc_bfs_tl { \__pdfcc_n:n { \l__pdfcc_bfs_tl * \l__pdfcc_s_fp } }
+          \__pdfcc_hex:nN {#2} \l__pdfcc_tmp_str
+          \__pdfcc_if_set:nTF { id }
+            { \tl_set:Ne \l__pdfcc_code_tl { \__pdfcc_get:n { id } } \tl_set:Nn \l__pdfcc_isid_tl { 1 } }
+            {
+              \__pdfcc_keycode:nN { \__pdfcc_get:n { key } } \l__pdfcc_code_tl
+              \tl_set:Nn \l__pdfcc_isid_tl { 0 }
+              \int_compare:nNnT { \l__pdfcc_code_tl } < 0
+                { \msg_error:nne { pdfcc } { bad-key } { \__pdfcc_get:n { key } } }
+            }
+          \hbox_set:Nn \l__pdfcc_btn_box
+            {
+              \__pdfcc_mark:
+              \__pdfcc_button:nnnnn { \l__pdfcc_tmpa_tl } { \l__pdfcc_tmpb_tl } { \l__pdfcc_tmp_str }
+                { \l__pdfcc_code_tl } { \l__pdfcc_isid_tl }
+              \__pdfcc_size:nn { \l__pdfcc_tmpa_tl } { \l__pdfcc_tmpb_tl }
+            }
+          \mode_leave_vertical: \box_use:N \l__pdfcc_btn_box
+        }
+    \group_end:
+  }
+% the program's text
+\NewDocumentCommand \pdfcctitle { O{} }
+  { \group_begin: \__pdfcc_place_init:n {#1} \__pdfcc_get:n { title } \group_end: }
+\NewDocumentCommand \pdfccsubtitle { O{} }
+  { \group_begin: \__pdfcc_place_init:n {#1} \__pdfcc_get:n { subtitle } \group_end: }
+\NewDocumentCommand \pdfcchelp { O{} }
+  {
+    \group_begin: \__pdfcc_place_init:n {#1}
+      \exp_args:Ne \__pdfcc_lines:n { \__pdfcc_get:n { help } }
+    \group_end:
+  }
+\NewDocumentCommand \pdfccfooter { O{} }
+  {
+    \group_begin: \__pdfcc_place_init:n {#1}
+      \exp_args:Ne \__pdfcc_lines:n { \__pdfcc_get:n { footer } }
+    \group_end:
+  }
+
+% ---- all components, laid out like pdfcc's own page
+\bool_new:N \l__pdfcc_t_bool   % terminal
+\bool_new:N \l__pdfcc_d_bool   % display
+\bool_new:N \l__pdfcc_k_bool   % keyboard
+\bool_new:N \l__pdfcc_b_bool   % buttons
+\bool_new:N \l__pdfcc_h_bool   % help
+\bool_new:N \l__pdfcc_side_bool
+\fp_new:N \l__pdfcc_tw_fp
+\fp_new:N \l__pdfcc_dw_fp
+\fp_new:N \l__pdfcc_cw_fp
+\fp_new:N \l__pdfcc_bw_fp
+\fp_new:N \l__pdfcc_inner_fp
+\clist_new:N \l__pdfcc_show_clist
+\cs_new_protected:Npn \__pdfcc_use:nN #1#2
+  { \bool_set:Nn #2 { \__pdfcc_if_on_p:n { has/#1 } && ! \__pdfcc_if_is_p:nn {#1} { false } } }
+\NewDocumentCommand \pdfccprogram { O{} }
+  {
+    \group_begin:
+      \__pdfcc_place_init:n {#1}
+      \bool_if:NT \l__pdfcc_ok_bool { \__pdfcc_program: }
+    \group_end:
+  }
+\cs_new_protected:Npn \__pdfcc_program:
+  {
+    \__pdfcc_use:nN { terminal } \l__pdfcc_t_bool
+    \__pdfcc_use:nN { display } \l__pdfcc_d_bool
+    \__pdfcc_use:nN { keyboard } \l__pdfcc_k_bool
+    \__pdfcc_use:nN { buttons } \l__pdfcc_b_bool
+    \clist_set:Ne \l__pdfcc_show_clist { \__pdfcc_if_set:nTF { show } { \__pdfcc_get:n { show } } { help } }
+    \bool_set_false:N \l__pdfcc_h_bool
+    \clist_if_in:NnT \l__pdfcc_show_clist { help }
+      { \exp_args:Ne \tl_if_blank:nF { \__pdfcc_get:n { help } } { \bool_set_true:N \l__pdfcc_h_bool } }
+    % natural sizes
+    \fp_zero:N \l__pdfcc_tw_fp \fp_zero:N \l__pdfcc_dw_fp \fp_zero:N \l__pdfcc_bw_fp
+    \bool_if:NT \l__pdfcc_t_bool { \__pdfcc_term_measure: \fp_set_eq:NN \l__pdfcc_tw_fp \l__pdfcc_w_fp }
+    \bool_if:NT \l__pdfcc_d_bool { \__pdfcc_disp_measure: \fp_set_eq:NN \l__pdfcc_dw_fp \l__pdfcc_w_fp }
+    \bool_if:NT \l__pdfcc_b_bool
+      { \__pdfcc_cell: \__pdfcc_btn_measure: \fp_set:Nn \l__pdfcc_bw_fp { \l__pdfcc_c_fp * \l__pdfcc_cell_fp } }
+    \fp_set:Nn \l__pdfcc_cw_fp
+      { \bool_if:NTF \l__pdfcc_k_bool { max ( 190 , \l__pdfcc_bw_fp ) } { \l__pdfcc_bw_fp } }
+    \bool_lazy_and:nnT { \fp_compare_p:nNn \l__pdfcc_cw_fp = 0 } { \l__pdfcc_h_bool }
+      { \fp_set:Nn \l__pdfcc_cw_fp { 190 } }
+    % terminal and controls side by side if that fits
+    \__pdfcc_avail:
+    \bool_set:Nn \l__pdfcc_side_bool
+      {
+        \l__pdfcc_t_bool && \fp_compare_p:nNn \l__pdfcc_cw_fp > 0 &&
+        (
+          \__pdfcc_if_is_p:nn { controls } { right } ||
+          (
+            ! \__pdfcc_if_is_p:nn { controls } { below } &&
+            \fp_compare_p:nNn { \l__pdfcc_tw_fp + 12 + \l__pdfcc_cw_fp } < { \l__pdfcc_avail_fp + 0.01 }
+          )
+        )
+      }
+    \fp_set:Nn \l__pdfcc_inner_fp
+      {
+        max ( \l__pdfcc_dw_fp ,
+              \bool_if:NTF \l__pdfcc_side_bool
+                { \l__pdfcc_tw_fp + 12 + \l__pdfcc_cw_fp }
+                { max ( \l__pdfcc_tw_fp , \l__pdfcc_cw_fp ) } )
+      }
+    \__pdfcc_scale:n { \l__pdfcc_inner_fp }
+    % boxes
+    \bool_if:NT \l__pdfcc_t_bool { \__pdfcc_term_box:N \l__pdfcc_term_box }
+    \bool_if:NT \l__pdfcc_d_bool { \__pdfcc_disp_box:N \l__pdfcc_disp_box }
+    \bool_if:NT \l__pdfcc_b_bool { \__pdfcc_btn_box:N \l__pdfcc_btn_box }
+    \bool_if:NT \l__pdfcc_k_bool
+      { \__pdfcc_kbd_box:Nn \l__pdfcc_kbd_box { \__pdfcc_n:n { max ( 190 , \l__pdfcc_bw_fp ) } } }
+    \tl_set:Ne \l__pdfcc_tmpa_tl { \__pdfcc_n:n { 12 * \l__pdfcc_s_fp } }          % gap
+    \tl_set:Ne \l__pdfcc_tmpb_tl { \__pdfcc_n:n { 8 * \l__pdfcc_s_fp } }           % small gap
+    \vbox_set_top:Nn \l__pdfcc_ctl_box   % top-aligned: its baseline is its top
+      {
+        \skip_zero:N \parskip \skip_zero:N \parindent \offinterlineskip
+        \skip_vertical:n { 0pt }
+        \bool_if:NT \l__pdfcc_k_bool
+          { \box_use:N \l__pdfcc_kbd_box \skip_vertical:n { \l__pdfcc_tmpb_tl bp } }
+        \bool_if:NT \l__pdfcc_b_bool
+          { \box_use:N \l__pdfcc_btn_box \skip_vertical:n { \l__pdfcc_tmpb_tl bp } }
+        \bool_if:NT \l__pdfcc_h_bool
+          {
+            \hbox:n
+              {
+                \parbox [t] { \__pdfcc_n:n { \l__pdfcc_cw_fp * \l__pdfcc_s_fp } bp }
+                  {
+                    \raggedright \footnotesize \color_select:n { black!75 }
+                    \exp_args:Ne \__pdfcc_lines:n { \__pdfcc_get:n { help } }
+                  }
+              }
+          }
+      }
+    \mode_leave_vertical:
+    \vbox:n
+      {
+        \skip_zero:N \parskip \skip_zero:N \parindent \offinterlineskip
+        \clist_if_in:NnT \l__pdfcc_show_clist { title }
+          {
+            \hbox:n { \large \bfseries \__pdfcc_get:n { title } \strut }
+            \skip_vertical:n { 4pt }
+          }
+        \clist_if_in:NnT \l__pdfcc_show_clist { subtitle }
+          {
+            \hbox:n { \small \__pdfcc_get:n { subtitle } \strut }
+            \skip_vertical:n { 6pt }
+          }
+        \bool_if:NT \l__pdfcc_d_bool
+          {
+            \hbox_to_wd:nn { \__pdfcc_n:n { \l__pdfcc_inner_fp * \l__pdfcc_s_fp } bp }
+              { \tex_hss:D \box_use:N \l__pdfcc_disp_box \tex_hss:D }
+            \bool_lazy_or:nnT { \l__pdfcc_t_bool } { \fp_compare_p:nNn \l__pdfcc_cw_fp > 0 }
+              { \skip_vertical:n { \l__pdfcc_tmpa_tl bp } }
+          }
+        \bool_if:NTF \l__pdfcc_side_bool
+          {
+            \hbox:n
+              {
+                \vbox_top:n { \skip_vertical:n { 0pt } \box_use:N \l__pdfcc_term_box }
+                \skip_horizontal:n { \l__pdfcc_tmpa_tl bp }
+                \box_use:N \l__pdfcc_ctl_box
+              }
+          }
+          {
+            \bool_if:NT \l__pdfcc_t_bool
+              {
+                \box_use:N \l__pdfcc_term_box
+                \fp_compare:nNnT \l__pdfcc_cw_fp > 0 { \skip_vertical:n { \l__pdfcc_tmpa_tl bp } }
+              }
+            \fp_compare:nNnT \l__pdfcc_cw_fp > 0 { \hbox:n { \box_use:N \l__pdfcc_ctl_box } }
+          }
+        \clist_if_in:NnT \l__pdfcc_show_clist { footer }
+          {
+            \skip_vertical:n { 6pt }
+            \hbox:n
+              {
+                \parbox [t] { \__pdfcc_n:n { \l__pdfcc_inner_fp * \l__pdfcc_s_fp } bp }
+                  { \raggedright \footnotesize \exp_args:Ne \__pdfcc_lines:n { \__pdfcc_get:n { footer } } }
+              }
+          }
+        \skip_vertical:n { 0pt }
+      }
+  }
+
+% LuaLaTeX: the page's action is built while the page is shipped, from the
+% placements on it (pdfcc.here). Plain catcodes; no #, ~, % or \ in the Lua.
+\ExplSyntaxOff
+\ifdefined\directlua
+\directlua{
+  pdfcc = { order = {}, full = {}, light = {}, all = {}, first = {}, seen = {}, on = {} }
+  function pdfcc.add(name, full, light, all, first)
+    table.insert(pdfcc.order, name)
+    pdfcc.full[name] = full
+    pdfcc.light[name] = light
+    pdfcc.all[name] = all
+    pdfcc.first[name] = first
+  end
+  function pdfcc.here(name)
+    pdfcc.on[name] = true
+  end
+  function pdfcc.finish()
+    local page = tex.count["g_shipout_readonly_int"]
+    local parts, closers = {}, 0
+    for _, name in ipairs(pdfcc.order) do
+      if pdfcc.on[name] or pdfcc.all[name] then
+        local s
+        if pdfcc.first[name] and not pdfcc.all[name] and pdfcc.seen[name] then
+          s = string.gsub(pdfcc.light[name], "PAGE", tostring(pdfcc.seen[name]))
+          closers = closers + 3
+        else
+          s = pdfcc.full[name]
+          closers = closers + 4
+        end
+        if pdfcc.on[name] and not pdfcc.seen[name] then
+          pdfcc.seen[name] = page
+        end
+        table.insert(parts, s)
+      end
+    end
+    pdfcc.on = {}
+    if closers == 0 then
+      return
+    end
+    pdfcc.saved = pdf.getpageattributes() or ""
+    pdf.setpageattributes(pdfcc.saved .. " /AA << /O " .. table.concat(parts, " /Next ")
+      .. string.rep(" >>", closers) .. " >>")
+  end
+  function pdfcc.restore()
+    if pdfcc.saved then
+      pdf.setpageattributes(pdfcc.saved)
+      pdfcc.saved = nil
+    end
+  end
+}
+\fi
+\endinput

@@ -1,14 +1,47 @@
 // pdfcc_runtime.js - runs inside the PDF viewer's JavaScript engine, before the
 // Emscripten output. It connects Emscripten's I/O to the form fields that
-// mkpdf.py laid out on the page. Config comes from PDFCC_CONFIG (written by
-// mkpdf.py). Everything public lives on the global `pdfcc` object, because
-// PDF timers and field actions can only call global expressions.
-/* exported pdfcc */
+// mkpdf.py (or tex/pdfcc.sty) laid out. Config comes from PDFCC_CONFIG.
+// Everything public lives on one global object, named by C.name ("pdfcc"
+// unless the program was built with --name), because PDF timers and field
+// actions can only call global expressions. Several programs can run in one
+// document: each has its own object, fields (C.*.prefix) and Emscripten code,
+// which P.load runs in a function scope of its own.
+//
+// Action order: PDFCC_CONFIG, this script, files (addFile), program (load),
+// start. pdfcc.sty runs that sequence on every page that shows the program;
+// after the first time, each step returns at once (only start and this
+// script's first lines run).
 /* global console */
-var pdfcc = (function () {
+(function () {
   var C = PDFCC_CONFIG;
-  var P = { config: C, files: [], args: (C.args || []).slice(), keyState: {}, echo: false };
+  var NAME = C.name || "pdfcc";
+  var old = globalThis[NAME];
+  if (old && old.config) { globalThis.pdfccCurrent = old; return; } // already set up
+  var P = { config: C, name: NAME, files: [], args: (C.args || []).slice(), keyState: {}, echo: false };
   var t0 = Date.now();
+  globalThis[NAME] = P;
+  // Instance-independent entry points for program and file scripts that are
+  // shared by several instances (pdfcc.sty): they act on the instance whose
+  // config ran last.
+  globalThis.pdfccCurrent = P;
+  globalThis.pdfccLoad = function (body) { globalThis.pdfccCurrent.load(body); };
+  globalThis.pdfccAddFile = function (path, b64, extraArgs) { globalThis.pdfccCurrent.addFile(path, b64, extraArgs); };
+  globalThis.pdfccArgs = function (args) { globalThis.pdfccCurrent.defaultArgs(args); };
+
+  // The program's own variables (heap views, FS, exports). P.load replaces these
+  // with functions that read them in the program's scope; these read globals.
+  var X = {
+    heapU8: function () { return HEAPU8; },
+    heap32: function () { return HEAP32; },
+    fs: function () { return typeof FS !== "undefined" ? FS : undefined; },
+    stackSave: function () { return typeof stackSave === "function" ? stackSave() : null; },
+    stackRestore: function (sp) { stackRestore(sp); },
+    tick: function () { _pdfcc_tick(); },
+    overflow: function () { _pdfcc_stack_overflow(); },
+    callMain: function (args) {
+      if (typeof callMain === "function") callMain(args); else P.Module.callMain(args);
+    }
+  };
 
   // ---------------------------------------------------------- polyfills --
   // PDF JavaScript has app.setTimeOut/app.setInterval (taking code strings,
@@ -26,7 +59,7 @@ var pdfcc = (function () {
     var id = nextTimer++;
     if (typeof fn !== "function") { var src = String(fn); fn = function () { eval(src); }; }
     timers[id] = { fn: fn, args: args, repeat: repeat };
-    var expr = "pdfcc._fire(" + id + ")";
+    var expr = NAME + "._fire(" + id + ")";
     ms = Math.max(1, ms | 0);
     timers[id].h = repeat ? app.setInterval(expr, ms) : app.setTimeOut(expr, ms);
     return id;
@@ -37,8 +70,13 @@ var pdfcc = (function () {
     try { if (t.repeat) app.clearInterval(t.h); else app.clearTimeOut(t.h); } catch { /* already fired */ }
     delete timers[id];
   }
-  globalThis.setTimeout = function (fn, ms) { return addTimer(fn, ms, [].slice.call(arguments, 2), false); };
-  globalThis.setInterval = function (fn, ms) { return addTimer(fn, ms, [].slice.call(arguments, 2), true); };
+  // Each program gets these through P.load; the globals are for code outside
+  // (with several programs, they belong to the last one loaded).
+  P.setTimeout = function (fn, ms) { return addTimer(fn, ms, [].slice.call(arguments, 2), false); };
+  P.setInterval = function (fn, ms) { return addTimer(fn, ms, [].slice.call(arguments, 2), true); };
+  P.clearTimeout = P.clearInterval = clearTimer;
+  globalThis.setTimeout = P.setTimeout;
+  globalThis.setInterval = P.setInterval;
   globalThis.clearTimeout = globalThis.clearInterval = clearTimer;
   if (typeof performance === "undefined")
     globalThis.performance = { now: function () { return Date.now() - t0; } };
@@ -47,10 +85,12 @@ var pdfcc = (function () {
   // dialog!) and Emscripten's shell setup wires console.log to it. We point
   // console at the terminal instead (again after the Emscripten code ran).
   P.log = function () { P.termWrite([].join.call(arguments, " ") + "\n"); };
+  P.console = {};
   P.fixConsole = function () {
-    var c = { log: P.log, info: P.log, warn: P.log, error: P.log, debug: function () {} };
-    try { globalThis.console = c; } catch { /* read-only global */ }
-    try { if (typeof console === "object") for (var k in c) console[k] = c[k]; } catch { /* frozen */ }
+    var c = { log: P.log, info: P.log, warn: P.log, error: P.log, debug: function () {} }, k;
+    for (k in c) P.console[k] = c[k];
+    try { globalThis.console = P.console; } catch { /* read-only global */ }
+    try { if (typeof console === "object") for (k in c) console[k] = c[k]; } catch { /* frozen */ }
   };
   P.fixConsole();
 
@@ -177,11 +217,28 @@ var pdfcc = (function () {
   P.setField = setField;
 
   // ------------------------------------------------------------ display --
-  // One comb text field per pixel row; each character cell is one pixel and
-  // its glyph (from a ramp measured in Chrome's PDF renderer) sets the shade.
+  // One text field per pixel row; each character is one pixel and its glyph
+  // sets the shade. Ramps: glyphs light -> dark, with the mean brightness each
+  // produces in Chrome's PDF renderer (measured with tests/measure_ramp.py).
+  // Both use Courier-Bold, so every glyph has the same width.
+  //  fast:    plain text fields, glyph advance = pixel width. ~80 ms per 240x150 frame.
+  //  quality: comb fields (one cell per character) with glyphs drawn 1.7x larger than
+  //           the cell, so they overlap into near-solid black. ~3x the contrast,
+  //           but PDFium needs ~2.4x longer to redraw them.
+  var RAMPS = {
+    fast: [[" ", 255], ["_", 245], [".", 241], [",", 235], [":", 226], [";", 217], ["~", 215],
+           ["\"", 210], ["!", 201], ["*", 195], [")", 187], ["=", 180], ["j", 174], ["r", 166],
+           ["t", 159], ["z", 153], ["I", 146], ["%", 140], ["C", 133], ["d", 126], ["U", 119],
+           ["K", 114], ["W", 106], ["B", 99]],
+    quality: [[" ", 255], ["'", 235], ["\"", 216], [",", 215], [".", 212], [";", 206], [":", 204],
+              ["-", 187], ["^", 178], ["!", 168], ["~", 154], ["(", 148], ["T", 140], ["7", 127],
+              ["l", 123], ["i", 108], ["F", 99], ["2", 88], ["q", 80], ["#", 69], ["V", 60],
+              ["w", 49], ["K", 39], ["W", 31]]
+  };
   var D = C.display ? {
     cols: C.display.cols, rows: C.display.rows, prefix: C.display.prefix,
-    ramp: C.display.ramp, dither: C.display.dither !== false,
+    ramp: C.display.ramp || RAMPS[C.display.mode === "quality" ? "quality" : "fast"],
+    dither: C.display.dither !== false,
     prev: [], lum: new Uint8Array(C.display.cols * C.display.rows), pal: new Uint8Array(256)
   } : null;
   P.display = D;
@@ -203,14 +260,14 @@ var pdfcc = (function () {
   }
   P.setPalette = function (ptr, n) {
     for (var i = 0; i < n && i < 256; i++) {
-      var r = HEAPU8[ptr + i * 3], g = HEAPU8[ptr + i * 3 + 1], b = HEAPU8[ptr + i * 3 + 2];
+      var H8 = X.heapU8(), r = H8[ptr + i * 3], g = H8[ptr + i * 3 + 1], b = H8[ptr + i * 3 + 2];
       D.pal[i] = (r * 77 + g * 150 + b * 29) >> 8;
     }
   };
   // Convert any pixel format to the display's luminance grid (nearest neighbour).
   P.present = function (ptr, w, h, fmt) {
     if (!D) return;
-    var cols = D.cols, rows = D.rows, lum = D.lum, H8 = HEAPU8, pal = D.pal;
+    var cols = D.cols, rows = D.rows, lum = D.lum, H8 = X.heapU8(), pal = D.pal;
     var xs = new Int32Array(cols);
     for (var x = 0; x < cols; x++) xs[x] = Math.floor((x + 0.5) * w / cols);
     for (var y = 0; y < rows; y++) {
@@ -262,9 +319,9 @@ var pdfcc = (function () {
   }
   P.pollEvent = function (ptr) {
     if (!events.length || events[0][4] > frame) return 0;
-    var e = events.shift();
-    HEAP32[ptr >> 2] = e[0]; HEAP32[(ptr >> 2) + 1] = e[1];
-    HEAP32[(ptr >> 2) + 2] = e[2]; HEAP32[(ptr >> 2) + 3] = e[3];
+    var e = events.shift(), H32 = X.heap32();
+    H32[ptr >> 2] = e[0]; H32[(ptr >> 2) + 1] = e[1];
+    H32[(ptr >> 2) + 2] = e[2]; H32[(ptr >> 2) + 3] = e[3];
     return 1;
   };
   P.frameEnd = function () {
@@ -365,8 +422,9 @@ var pdfcc = (function () {
     var b = lines.shift(), start = inPos, end = b.length - 1, n = Math.min(end - start, size - 1);
     inPos = 0;
     while (n > 0 && start + n < end && (b[start + n] & 0xc0) === 0x80) n--;
-    for (var i = 0; i < n; i++) HEAPU8[ptr + i] = b[start + i];
-    HEAPU8[ptr + n] = 0;
+    var H8 = X.heapU8();
+    for (var i = 0; i < n; i++) H8[ptr + i] = b[start + i];
+    H8[ptr + n] = 0;
     return n;
   };
   // stdin device: a byte, undefined = no data yet (EAGAIN), null = end of input
@@ -403,11 +461,12 @@ var pdfcc = (function () {
   // Called by the file actions that follow this script. Empty data = an
   // unfilled slot (see tools/inject.py), which is skipped.
   P.addFile = function (path, b64, extraArgs) {
-    if (!b64) return;
+    if (!b64 || P.loaded) return;
     P.files.push({ path: path, b64: b64 });
     if (extraArgs) P.args = P.args.concat(extraArgs);
   };
   function writeFiles() {
+    var FS = X.fs();
     P.files.forEach(function (f) {
       var slash = f.path.lastIndexOf("/");
       if (slash > 0) try { FS.mkdirTree(f.path.slice(0, slash)); } catch { /* exists */ }
@@ -420,16 +479,16 @@ var pdfcc = (function () {
   var loop = null;
   P.startLoop = function (ms) {
     P.stopLoop();
-    loop = app.setInterval("pdfcc._tick()", Math.max(0, ms | 0));
+    loop = app.setInterval(NAME + "._tick()", Math.max(0, ms | 0));
   };
   P.stopLoop = function () { if (loop) { try { app.clearInterval(loop); } catch { /* gone */ } loop = null; } };
   P._tick = function () {
-    var sp = typeof stackSave === "function" ? stackSave() : null;
-    try { _pdfcc_tick(); }
+    var sp = X.stackSave();
+    try { X.tick(); }
     catch (e) {
       if (P.recoverOverflow && e instanceof RangeError && /call stack/i.test(e.message) && sp !== null) {
-        stackRestore(sp); // the abandoned C frames never popped their stack space
-        P.guard(function () { _pdfcc_stack_overflow(); });
+        X.stackRestore(sp); // the abandoned C frames never popped their stack space
+        P.guard(function () { X.overflow(); });
       } else P.guard(function () { throw e; });
     }
     P.frameEnd();
@@ -453,7 +512,14 @@ var pdfcc = (function () {
   };
 
   // Emscripten Module configuration
-  globalThis.Module = {
+  // Placeholder of the keyboard field: from the config (mkpdf.py) or the
+  // field's initial value (pdfcc.sty).
+  if (C.keyboard && C.keyboard.placeholder === undefined) {
+    try { var kf = getField(C.keyboard.field); C.keyboard.placeholder = kf ? String(kf.value) : ""; }
+    catch { C.keyboard.placeholder = ""; }
+  }
+
+  P.Module = {
     noInitialRun: true,
     print: function (s) { P.termWrite(s + "\n"); },
     printErr: function (s) { P.termWrite(s + "\n"); },
@@ -461,23 +527,54 @@ var pdfcc = (function () {
     stdout: P.termByte,
     stderr: P.termByte,
     preRun: [writeFiles],
-    onRuntimeInitialized: function () { P.ready = true; if (P.wantStart) app.setTimeOut("pdfcc._go()", 50); },
+    onRuntimeInitialized: function () { P.ready = true; if (P.wantStart) app.setTimeOut(NAME + "._go()", 50); },
     preMainLoop: function () {},
     postMainLoop: function () { P.frameEnd(); },
     onAbort: function (what) { P.termWrite("\n[abort] " + what + "\n"); P.flush(); }
+  };
+  if (NAME === "pdfcc") globalThis.Module = P.Module; // for code that expects the usual global
+
+  // Runs the Emscripten output, which mkpdf.py wraps as
+  //   NAME.load(function (pdfcc, Module, setTimeout, ..., print, printErr) { ... });
+  // Inside, `pdfcc` is this object and the timers and console are this program's.
+  // print is undefined there: in PDF JS the global print() opens the print dialog.
+  // The wrapper's first statement passes the program's variables to bind().
+  P.load = function (body) {
+    if (P.loaded) return;
+    P.loaded = true;
+    try {
+      body.call(globalThis, P, P.Module, P.setTimeout, P.setInterval, P.clearTimeout, P.clearInterval,
+                P.console);
+    } catch (e) { P.guard(function () { throw e; }); }
+  };
+  P.bind = function (x) { for (var k in x) X[k] = x[k]; };
+  // argv from the program script, unless the config has its own
+  P.defaultArgs = function (args) {
+    if (!P.loaded && !C.args) P.args = args.concat(P.args);
   };
 
   // Called by the last action, after the Emscripten code. Starts main() as
   // soon as the runtime is ready (immediately with fastcomp/asm.js).
   // main() is started from a timer so the viewer paints the page first.
   var starting = false; // "Starting..." shown (only on an untouched terminal)
-  P.start = function () {
+  // loadPage: set by pdfcc.sty (load=first) on pages that do not load the program
+  P.start = function (loadPage) {
+    if (!P.loaded) {
+      if (loadPage && T && !P.hinted) {
+        P.hinted = true;
+        P.termWrite("[The program starts when page " + loadPage + " is shown.]\n");
+        P.flush();
+      }
+      return;
+    }
+    if (P.wantStart) return;
     P.wantStart = true;
+    if (P.hinted) { P.hinted = false; P.termClear(); }
     if (T && T.cx === 0 && T.cy === 0 && !T.lines[0].join("").trim()) {
       starting = true; P.termSetRow(0, "Starting..."); T.cx = 11; P.flush();
     }
-    if (P.ready || Module.calledRun || typeof FS === "undefined") // (no FS: plain JS program)
-      app.setTimeOut("pdfcc._go()", 50);
+    if (P.ready || P.Module.calledRun || !X.fs()) // (no FS: plain JS program)
+      app.setTimeOut(NAME + "._go()", 50);
   };
   P._go = function () {
     if (P.started) return;
@@ -485,10 +582,7 @@ var pdfcc = (function () {
     if (starting) { P.termSetRow(0, ""); T.cx = 0; }
     P.fixConsole();
     if (C.keyboard) setField(C.keyboard.field, C.keyboard.placeholder || "");
-    P.guard(function () {
-      if (typeof callMain === "function") callMain(P.args); else Module.callMain(P.args);
-    });
+    P.guard(function () { X.callMain(P.args); });
     P.flush();
   };
-  return P;
 })();

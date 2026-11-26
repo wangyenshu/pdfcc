@@ -1,0 +1,18 @@
+% \DocumentMetadata (pdfmanagement), hyperref form, load=first, two instances
+\DocumentMetadata{}
+\documentclass{article}
+\usepackage{hyperref}
+\usepackage{pdfcc}
+\pdfccload[load=first]{hello}
+\pdfccload[name=second, terminal={cols=40, rows=6}]{hello}
+\begin{document}
+\begin{Form}
+\TextField[name=other,width=4cm,value=hyperref]{A hyperref field:}
+\end{Form}
+
+\pdfccprogram[program=hello, show=title]
+\newpage
+\pdfccterminal[program=hello, fontsize=6]
+
+\pdfccprogram[program=second]
+\end{document}

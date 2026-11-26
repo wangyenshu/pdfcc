@@ -35,6 +35,7 @@ def inject(data, files, manifest):
         out += b"\n"
     offsets = {}
     slots = {s["name"]: s for s in manifest["slots"]}
+    inst = manifest.get("instance", "pdfcc")
     for name, (content, path) in files.items():
         if name not in slots:
             sys.exit(f"inject: no slot named {name!r} (have: {', '.join(slots)})")
@@ -42,7 +43,7 @@ def inject(data, files, manifest):
         if path:
             slot["path"] = path
         extra = json.dumps(slot["args"]) if slot.get("args") else "null"
-        js = f"pdfcc.addFile({json.dumps(slot['path'])}, \"{base64.b64encode(content).decode()}\", {extra});"
+        js = f"{inst}.addFile({json.dumps(slot['path'])}, \"{base64.b64encode(content).decode()}\", {extra});"
         stream = zlib.compress(js.encode("ascii"), 9)
         offsets[slot["obj"]] = len(out)
         out += f"{slot['obj']} 0 obj\n<</Length {len(stream)} /Filter /FlateDecode>>\nstream\n".encode()

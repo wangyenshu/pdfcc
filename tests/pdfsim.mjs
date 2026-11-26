@@ -7,6 +7,7 @@
 //   node tests/pdfsim.mjs hello.pdf --until "guess:" --type "50\n" --until "too"
 //   node tests/pdfsim.mjs mandel.pdf --wait 2000 --display
 //   node tests/pdfsim.mjs game.pdf --press "^" --wait 300 --click 3,4
+//   node tests/pdfsim.mjs both.pdf --program snake ...   (built with --name snake)
 import fs from "node:fs";
 import vm from "node:vm";
 import zlib from "node:zlib";
@@ -14,7 +15,7 @@ import zlib from "node:zlib";
 const args = process.argv.slice(2);
 const file = args.shift();
 const steps = [];
-let showDisplay = false, quiet = false;
+let showDisplay = false, quiet = false, inst = null;
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === "--type" || a === "--paste")
@@ -25,6 +26,7 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "--click") steps.push(["click", args[++i]]);
   else if (a === "--display") showDisplay = true;
   else if (a === "--quiet") quiet = true;
+  else if (a === "--program") inst = "pdfcc_" + args[++i];
   else throw new Error("unknown option " + a);
 }
 if (!steps.some(s => s[0] === "wait" || s[0] === "until")) steps.push(["wait", 300]);
@@ -61,6 +63,9 @@ for (const o of Object.values(objs)) {
   const ca = /\/CA \(([^)]*)\)/.exec(o.body);
   fields[t[1]] = { name: t[1], value: "", aa, caption: ca && ca[1] };
 }
+const manifest = [...text.matchAll(/%PDFCC (\{[^\n]*\})\n/g)].pop();
+inst ??= manifest ? JSON.parse(manifest[1]).instance || "pdfcc" : "pdfcc";
+const pre = inst + "_"; // field name prefix
 const pageObj = Object.values(objs).find(o => /\/Type \/Page\b/.test(o.body));
 const openAction = +/\/AA <<\/O (\d+) 0 R/.exec(pageObj.body)[1];
 
@@ -88,7 +93,7 @@ function runAction(num, event) {
 for (const js of chain(openAction)) run(js, file);
 
 // ---- input helpers ----
-const kbd = fields.pdfcc_kbd;
+const kbd = fields[pre + "kbd"];
 function type(str) {
   if (!kbd) throw new Error("this PDF has no keyboard field");
   if (kbd.aa.Fo) runAction(kbd.aa.Fo);
@@ -113,12 +118,13 @@ function press(label) {
 }
 function click(xy) {
   const [x, y] = xy.split(",");
-  const f = fields[`pdfcc_grid_${x}_${y}`];
+  const f = fields[`${pre}grid_${x}_${y}`];
   runAction(f.aa.D, { targetName: f.name }); runAction(f.aa.U, { targetName: f.name });
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const terminalText = () => Object.keys(fields).filter(n => n.startsWith("pdfcc_tty_"))
-  .sort((a, b) => +a.split("_")[2] - +b.split("_")[2]).map(n => fields[n].value).join("\n");
+const ttyRows = () => Object.keys(fields).filter(n => n.startsWith(pre + "tty_"))
+  .sort((a, b) => +a.slice(pre.length + 4) - +b.slice(pre.length + 4)).map(n => fields[n].value);
+const terminalText = () => ttyRows().join("\n");
 async function until(text, timeout = 30000) { // wait for the terminal to show text
   for (const t0 = Date.now(); !terminalText().includes(text) && Date.now() - t0 < timeout;) await sleep(25);
 }
@@ -132,12 +138,11 @@ for (const [kind, v] of steps) {
 }
 
 // ---- output ----
-const rows = Object.keys(fields).filter(n => n.startsWith("pdfcc_tty_"))
-  .sort((a, b) => +a.split("_")[2] - +b.split("_")[2]).map(n => fields[n].value);
+const rows = ttyRows();
 while (rows.length && !rows[rows.length - 1].trim()) rows.pop();
 if (!quiet) out(rows.join("\n"));
-if (showDisplay && sandbox.pdfcc.display) {
-  const D = sandbox.pdfcc.display, shades = " .:-=+*#%@";
+if (showDisplay && sandbox[inst].display) {
+  const D = sandbox[inst].display, shades = " .:-=+*#%@";
   const lumOf = {}; D.ramp.forEach(([c, l]) => (lumOf[c] = l));
   const sx = Math.max(1, Math.ceil(D.cols / 100)), sy = sx * 2;
   for (let y = 0; y < D.rows; y += sy) {

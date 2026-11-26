@@ -43,7 +43,7 @@
       if (!slot) throw new Error(`No slot named "${name}".`);
       if (f.path) slot.path = f.path;
       const extra = slot.args ? JSON.stringify(slot.args) : "null";
-      const js = enc.encode(`pdfcc.addFile(${JSON.stringify(slot.path)}, "${base64(f.data)}", ${extra});`);
+      const js = enc.encode(`${m.instance || "pdfcc"}.addFile(${JSON.stringify(slot.path)}, "${base64(f.data)}", ${extra});`);
       const z = await deflate(js);
       const head = enc.encode(`${slot.obj} 0 obj\n<</Length ${(z || js).length}${z ? " /Filter /FlateDecode" : ""}>>\nstream\n`);
       const tail = enc.encode("\nendstream\nendobj\n");
@@ -52,7 +52,8 @@
       pos += head.length + (z || js).length + tail.length;
       slot.filled = true;
     }
-    const manifest = { slots: m.slots, root: m.root, info: m.info };
+    const manifest = Object.assign({}, m);
+    delete manifest.startxref; delete manifest.size;
     const mline = enc.encode("%PDFCC " + JSON.stringify(manifest) + "\n");
     parts.push(mline);
     pos += mline.length;

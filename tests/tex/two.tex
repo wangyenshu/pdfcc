@@ -1,0 +1,22 @@
+% two programs, a hyperref form, tabularx, a custom button
+\documentclass{article}
+\usepackage{tabularx}
+\usepackage{hyperref}
+\usepackage{pdfcc}
+\pdfccload{snake}
+\pdfccload[keyboard={placeholder=Type here: é}]{hello}
+\begin{document}
+\begin{Form}
+\TextField[name=other,width=4cm,value=hyperref]{A hyperref field:}
+\end{Form}
+
+\pdfccprogram[program=snake, show={title,help}]
+\newpage
+\noindent\begin{tabularx}{\linewidth}{|X|l|}
+\hline
+\pdfccterminal[program=hello, terminal={theme=dark}] &
+\pdfcckeyboard[program=hello, width=3cm] \\
+\hline
+\end{tabularx}
+\pdfccbutton[program=snake, key=UP, width=2cm]{snake up}
+\end{document}

@@ -1,0 +1,19 @@
+% the same terminal on three overlays
+\documentclass{beamer}
+\usepackage{pdfcc}
+\pdfccload{hello}
+\pdfccload{life}
+\begin{document}
+\begin{frame}{Title}Intro.\end{frame}
+\begin{frame}{Overlays}
+\begin{columns}
+\column{0.6\textwidth}\pdfccterminal[program=hello]
+\column{0.35\textwidth}\pdfcckeyboard[program=hello, width=3.5cm]
+\end{columns}
+\pause Second. \pause Third.
+\end{frame}
+\begin{frame}{Life}
+\centering\pdfccdisplay[program=life, width=7cm]\par
+\pdfccbuttons[program=life, buttons={cell=26bp}]
+\end{frame}
+\end{document}

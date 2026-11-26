@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Measure how dark each glyph renders in Chrome's PDF viewer, to build the display
-ramps in tools/mkpdf.py (RAMP_FAST / RAMP_QUALITY).
+ramps in runtime/pdfcc_runtime.js (RAMPS.fast / RAMPS.quality).
 
     python3 tests/measure_ramp.py fast      # or: quality
 Needs Chrome + tests/chrome.mjs (puppeteer-core) + Pillow/numpy. Each printable ASCII
@@ -57,7 +57,7 @@ for i, c in enumerate(chars):
 res.sort(reverse=True)
 print(" ".join(f"{c}:{m}" for m, c in res))
 
-# pick evenly spaced, strictly darker glyphs -> paste into tools/mkpdf.py
+# pick evenly spaced, strictly darker glyphs -> paste into runtime/pdfcc_runtime.js
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 24
 hi, lo = res[0][0], res[-1][0]
 ramp, last = [], 256
@@ -69,4 +69,4 @@ for k in range(N):
     _, m, c = min(cands)
     ramp.append([c, m])
     last = m
-print("RAMP_%s = %s" % (mode.upper(), json.dumps(ramp)))
+print("%s: %s" % (mode, json.dumps(ramp)))

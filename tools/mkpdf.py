@@ -6,6 +6,8 @@
 The page is built from a layout (JSON file and/or command-line options):
 
     {
+      "name": "prog",  (optional; for several programs in one document: global
+                        JavaScript object pdfcc_prog, field names pdfcc_prog_*)
       "title": "My program",            "subtitle": "one line under the title",
       "display":  {"width": 160, "height": 100, "scale": 3, "pixel_aspect": 1.0,
                    "mode": "fast"|"quality", "dither": true, "gamma": 1.0},
@@ -37,21 +39,9 @@ from pdfwriter import PDF, Name, Stream, content_string  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME_JS = os.path.join(HERE, "..", "runtime", "pdfcc_runtime.js")
 
-# Glyph ramps for the display, light -> dark, with the mean brightness each glyph
-# produces in Chrome's PDF renderer (measured from screenshots at 100%
-# zoom with tests/measure_ramp.py). Both use Courier-Bold, so every glyph has the same width.
-#  fast:    plain text fields, glyph advance = pixel width. ~80 ms per 240x150 frame.
-#  quality: comb fields (one cell per character) with glyphs drawn 1.7x larger than
-#           the cell, so they overlap into near-solid black. ~3x the contrast,
-#           but PDFium needs ~2.4x longer to redraw them.
-RAMP_FAST = [[" ", 255], ["_", 245], [".", 241], [",", 235], [":", 226], [";", 217], ["~", 215],
-             ["\"", 210], ["!", 201], ["*", 195], [")", 187], ["=", 180], ["j", 174], ["r", 166],
-             ["t", 159], ["z", 153], ["I", 146], ["%", 140], ["C", 133], ["d", 126], ["U", 119],
-             ["K", 114], ["W", 106], ["B", 99]]
-RAMP_QUALITY = [[" ", 255], ["'", 235], ["\"", 216], [",", 215], [".", 212], [";", 206], [":", 204],
-                ["-", 187], ["^", 178], ["!", 168], ["~", 154], ["(", 148], ["T", 140], ["7", 127],
-                ["l", 123], ["i", 108], ["F", 99], ["2", 88], ["q", 80], ["#", 69], ["V", 60],
-                ["w", 49], ["K", 39], ["W", 31]]
+# Display glyphs are Courier-Bold (all glyphs the same width); the ramps of glyphs
+# by brightness are in runtime/pdfcc_runtime.js. In "quality" mode comb fields
+# draw glyphs this much larger than their cell, so they overlap.
 GLYPH_SCALE = 1.7
 
 KEYS = {"UP": 0x100, "DOWN": 0x101, "LEFT": 0x102, "RIGHT": 0x103, "SHIFT": 0x104,
@@ -97,6 +87,35 @@ def text_width(s, size):
     return len(s) * size * 0.5
 
 
+# The Emscripten output runs in a function scope of its own (P.load in the runtime),
+# so that several programs can share a document. Its first statement passes the
+# program's own variables to the runtime, which reads them from there.
+WRAP_PARAMS = "pdfcc, Module, setTimeout, setInterval, clearTimeout, clearInterval, console, print, printErr"
+PRELUDE = """pdfcc.bind({
+  heapU8: function () { return HEAPU8; },
+  heap32: function () { return HEAP32; },
+  fs: function () { return typeof FS !== "undefined" ? FS : undefined; },
+  stackSave: function () { return typeof stackSave === "function" ? stackSave() : null; },
+  stackRestore: function (sp) { stackRestore(sp); },
+  tick: function () { _pdfcc_tick(); },
+  overflow: function () { _pdfcc_stack_overflow(); },
+  callMain: function (args) { if (typeof callMain === "function") callMain(args); else Module.callMain(args); }
+});"""
+
+
+def instance_name(name):
+    """Global JavaScript object of a program, also the prefix of its field names."""
+    if not name:
+        return "pdfcc"
+    if not re.fullmatch(r"[a-z0-9]+", name):
+        raise ValueError(f"program name must be lowercase letters and digits, not {name!r}")
+    return "pdfcc_" + name
+
+
+def wrap_program(js_code, inst):
+    return f"{inst}.load(function ({WRAP_PARAMS}) {{\n{PRELUDE}\n{js_code}\n}});"
+
+
 def build(js_code, spec, out_path):
     pdf = PDF()
     page = pdf.reserve()
@@ -104,7 +123,9 @@ def build(js_code, spec, out_path):
                          "Encoding": Name("WinAnsiEncoding")})
              for k, v in [("Helv", "Helvetica"), ("HeBo", "Helvetica-Bold"),
                           ("Cour", "Courier"), ("CoBo", "Courier-Bold")]}
-    fields, content, config = [], [], {"args": spec.get("args", [])}
+    inst = instance_name(spec.get("name"))
+    pre = inst + "_"  # field names
+    fields, content, config = [], [], {"name": inst, "args": spec.get("args", [])}
 
     def js_action(code, nxt=None):
         code = re.sub(r"[^\x00-\x7f]", js_escape, code)
@@ -209,21 +230,20 @@ def build(js_code, spec, out_path):
             fs = pw / 0.6 * (GLYPH_SCALE if comb else 0.995)
             for row in range(rows):
                 extra = {"MaxLen": cols, "Ff": 1 | (1 << 24)} if comb else {"Ff": 1}
-                widget(f"pdfcc_px_{row}", flip(x, ytop + row * ph, w, ph), "Tx", V="",
+                widget(f"{pre}px_{row}", flip(x, ytop + row * ph, w, ph), "Tx", V="",
                        DA=f"/CoBo {fs:.3f} Tf 0 g", **extra)
-            config["display"] = {"cols": cols, "rows": rows, "prefix": "pdfcc_px_",
-                                 "ramp": RAMP_QUALITY if comb else RAMP_FAST,
+            config["display"] = {"cols": cols, "rows": rows, "prefix": pre + "px_", "mode": mode,
                                  "dither": disp.get("dither", True), "gamma": disp.get("gamma", 1.0)}
             grid = spec.get("click_grid")
             if grid:
                 # all cells share two actions; the cell is read from the field name
                 gc, gr = int(grid["cols"]), int(grid["rows"])
-                grid_aa = {"D": js_action("pdfcc._gridClick(event, 1)")[0],
-                           "U": js_action("pdfcc._gridClick(event, 0)")[0]}
+                grid_aa = {"D": js_action(f"{inst}._gridClick(event, 1)")[0],
+                           "U": js_action(f"{inst}._gridClick(event, 0)")[0]}
                 for gy in range(gr):
                     for gx in range(gc):
                         cr = flip(x + gx * w / gc, ytop + gy * h / gr, w / gc, h / gr)
-                        widget(f"pdfcc_grid_{gx}_{gy}", cr, "Btn", Ff=65536, MK={}, AA=grid_aa)
+                        widget(f"{pre}grid_{gx}_{gy}", cr, "Btn", Ff=65536, MK={}, AA=grid_aa)
         elif kind == "terminal":
             x, ytop, w, h = r
             dark = term.get("theme", "light") == "dark"
@@ -231,9 +251,9 @@ def build(js_code, spec, out_path):
             bg, fg = ("0.08 g", "0.55 1 0.55 rg") if dark else ("0.965 g", "0.1 g")
             content.append(f"{bg} {fx:.2f} {fy:.2f} {w:.2f} {h:.2f} re f")
             for row in range(trows):
-                widget(f"pdfcc_tty_{row}", flip(x + 4, ytop + 4 + row * tlh, w - 8, tlh), "Tx",
+                widget(f"{pre}tty_{row}", flip(x + 4, ytop + 4 + row * tlh, w - 8, tlh), "Tx",
                        V="", Ff=1, DA=f"/Cour {tfs:.2f} Tf {fg}")
-            config["terminal"] = {"cols": tcols, "rows": trows, "prefix": "pdfcc_tty_"}
+            config["terminal"] = {"cols": tcols, "rows": trows, "prefix": pre + "tty_"}
             if "echo" in term:
                 config["terminal"]["echo"] = bool(term["echo"])
         elif kind == "controls":
@@ -244,11 +264,11 @@ def build(js_code, spec, out_path):
                     "Click here, then type"
                 kr = flip(x, cy, KW, KH)
                 content.append(f"0.6 G 0.75 w {kr[0]:.2f} {kr[1]:.2f} {kr[2]:.2f} {kr[3]:.2f} re S")
-                widget("pdfcc_kbd", kr, "Tx", V=ph_text, Ff=4096, DA="/Helv 9 Tf 0.35 g",
-                       AA={"K": js_action("pdfcc._key(event)")[0],
-                           "Fo": js_action("pdfcc._kbdFocus(true)")[0],
-                           "Bl": js_action("pdfcc._kbdFocus(false)")[0]})
-                config["keyboard"] = {"field": "pdfcc_kbd", "placeholder": ph_text}
+                widget(f"{pre}kbd", kr, "Tx", V=ph_text, Ff=4096, DA="/Helv 9 Tf 0.35 g",
+                       AA={"K": js_action(f"{inst}._key(event)")[0],
+                           "Fo": js_action(f"{inst}._kbdFocus(true)")[0],
+                           "Bl": js_action(f"{inst}._kbdFocus(false)")[0]})
+                config["keyboard"] = {"field": pre + "kbd", "placeholder": ph_text}
                 cy += KH + 8
             for i, b in enumerate(buttons):
                 bx = x + b.get("col", 0) * CELL
@@ -256,11 +276,11 @@ def build(js_code, spec, out_path):
                 bw = b.get("w", 1) * CELL - 4
                 bh = b.get("h", 1) * CELL - 4
                 if "id" in b:
-                    down, up = f"pdfcc._button({int(b['id'])},1,1)", f"pdfcc._button({int(b['id'])},0,1)"
+                    down, up = f"{inst}._button({int(b['id'])},1,1)", f"{inst}._button({int(b['id'])},0,1)"
                 else:
                     code = keycode(b["key"])
-                    down, up = f"pdfcc._button({code},1)", f"pdfcc._button({code},0)"
-                widget(f"pdfcc_btn_{i}", flip(bx, by, bw, bh), "Btn", Ff=65536,
+                    down, up = f"{inst}._button({code},1)", f"{inst}._button({code},0)"
+                widget(f"{pre}btn_{i}", flip(bx, by, bw, bh), "Btn", Ff=65536,
                        DA="/Helv 10 Tf 0 g", MK={"BG": [0.9], "CA": str(b.get("label", b.get("key", "?")))},
                        AA={"D": js_action(down)[0], "U": js_action(up)[0]})
             if buttons:
@@ -271,9 +291,8 @@ def build(js_code, spec, out_path):
 
     # ------------------------------------------------------- javascript --
     # runtime -> one action per file/slot -> program -> start
-    start, _ = js_action("pdfcc.start();")
-    program, _ = js_action("try {\n" + js_code + "\n} catch (e) { pdfcc.guard(function () { throw e; }); }",
-                           nxt=start)
+    start, _ = js_action(f"{inst}.start();")
+    program, _ = js_action(wrap_program(js_code, inst), nxt=start)
     chain = program
     slots_manifest = []
     entries = [("file", f) for f in spec.get("files", [])] + [("slot", s) for s in spec.get("slots", [])]
@@ -284,7 +303,7 @@ def build(js_code, spec, out_path):
                 b64 = base64.b64encode(fh.read()).decode()
         else:
             b64 = f.get("default", "")
-        chain, stream = js_action(f"pdfcc.addFile({json.dumps(f['path'])}, \"{b64}\", {extra});", nxt=chain)
+        chain, stream = js_action(f"{inst}.addFile({json.dumps(f['path'])}, \"{b64}\", {extra});", nxt=chain)
         slots_manifest.insert(0, {"name": f.get("name") or os.path.basename(f["path"]), "path": f["path"],
                                   "args": f.get("args"), "obj": stream.num, "filled": bool(b64)})
     with open(RUNTIME_JS) as fh:
@@ -299,7 +318,12 @@ def build(js_code, spec, out_path):
     acro = pdf.add({"Fields": fields, "DR": {"Font": fonts}, "DA": "/Helv 0 Tf 0 g"})
     root = pdf.add({"Type": Name("Catalog"), "Pages": pages, "AcroForm": acro})
     info = pdf.add({"Title": spec.get("title", "pdfcc program"), "Producer": "pdfcc"})
-    manifest = {"slots": slots_manifest, "root": root.num, "info": info.num}
+    # the page layout (no file contents or paths), for tools/pdf2sty.py
+    layout = {k: spec[k] for k in ("title", "subtitle", "display", "terminal", "click_grid", "help",
+                                   "footer") if spec.get(k)}
+    layout.update(keyboard=kbd, buttons=buttons)
+    manifest = {"instance": inst, "slots": slots_manifest, "root": root.num, "info": info.num,
+                "layout": layout}
     data = pdf.to_bytes(root, info=info, comment="PDFCC " + json.dumps(manifest))
     with open(out_path, "wb") as fh:
         fh.write(data)
@@ -313,6 +337,8 @@ def parse_size(s):
 
 def apply_cli(spec, a):
     """Merge command-line options into a layout spec (CLI wins)."""
+    if a.name:
+        spec["name"] = a.name
     if a.title:
         spec["title"] = a.title
     if a.subtitle:
@@ -359,6 +385,8 @@ def apply_cli(spec, a):
 def add_cli_options(p):
     g = p.add_argument_group("page layout (override --layout)")
     g.add_argument("--layout", help="layout JSON file")
+    g.add_argument("--name", help="program name (lowercase letters, digits): needed to run several "
+                   "programs in one document, e.g. after tools/pdf2sty.py")
     g.add_argument("--title")
     g.add_argument("--subtitle")
     g.add_argument("--display", metavar="WxH", help="add a framebuffer display, e.g. 160x100")

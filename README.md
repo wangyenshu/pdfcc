@@ -8,6 +8,7 @@ bin/pdfcc hello.c -o hello.pdf
 bin/pdfcc game.c -o game.pdf --display 160x100 --buttons arrows
 bin/pdfcc main.c libfoo.a -o foo.pdf --memory 128    # prebuilt archives
 bin/pdfcc prog.c --async -o prog.pdf                 # blocking stdin, sleep()
+bin/pdfcc prog.c -o doc/prog.pdf --latex             # also for LaTeX documents
 ```
 
 The output is one self-contained PDF. Tested in Chrome 153 (Linux).
@@ -119,7 +120,7 @@ Flags, or a JSON file passed with `--layout` (flags override it):
 
 ```json
 {
-  "title": "Snake", "subtitle": "...",
+  "name": "snake", "title": "Snake", "subtitle": "...",
   "display":  {"width": 128, "height": 80, "scale": 4.0, "pixel_aspect": 1.0,
                "mode": "fast", "dither": true, "gamma": 1.0},
   "terminal": {"cols": 52, "rows": 6, "font_size": 7, "theme": "light", "echo": false},
@@ -133,11 +134,11 @@ Flags, or a JSON file passed with `--layout` (flags override it):
 }
 ```
 
-Layout flags: `--title`, `--subtitle`, `--display WxH`, `--scale`, `--quality`,
+Layout flags: `--name`, `--title`, `--subtitle`, `--display WxH`, `--scale`, `--quality`,
 `--terminal CxR`, `--no-terminal`, `--dark`, `--no-keyboard`, `--buttons arrows|gamepad|JSON`,
 `--click-grid CxR`, `--help-line`, `--arg`, `--file SRC[:/PATH]`, `--slot NAME[:/PATH[:ARGS]]`.
 Build flags: `--toolchain`, `--async`, `--memory MB`, `--memory-growth`, `--stack KB`,
-`--keep-js`, `--env`. Other arguments go to emcc. With `-o x.js` only the JavaScript is
+`--keep-js`, `--latex`, `--env`. Other arguments go to emcc. With `-o x.js` only the JavaScript is
 written; `tools/mkpdf.py x.js -o x.pdf` packages it.
 
 Display modes, full 240×150 redraw in Chrome:
@@ -159,6 +160,28 @@ tools/inject.py doom_nowad.pdf -o doom.pdf --file iwad=doom1.wad
 
 `web/index.html` does the same in a browser. Both append an incremental PDF update.
 
+`name` (lowercase letters and digits) names the program's JavaScript object (`pdfcc_NAME`)
+and the prefix of its field names (`pdfcc_NAME_`). Without it, both are `pdfcc`.
+
+## LaTeX
+
+`tools/pdf2sty.py prog.pdf -o DIR` (or `--latex` when building) writes the files for
+`tex/pdfcc.sty`:
+
+```latex
+\usepackage{pdfcc}
+\pdfccload{snake}  \pdfccload{fricas}
+...
+\pdfccprogram[program=snake]
+\pdfccterminal[program=fricas, fontsize=7pt]  \pdfcckeyboard[program=fricas]
+```
+
+A document can hold several programs, and the same program more than once. Terminal,
+display, keyboard and buttons can be placed separately, sized and colored, on any page,
+including Beamer overlays and tabularx cells. They work alongside hyperref forms and
+`\DocumentMetadata`. A program loads when a page that shows it is opened. See
+`tex/README.md`.
+
 ## Implementation
 
 - Display: one read-only text field per row, one character per pixel. Glyphs come from a
@@ -167,7 +190,8 @@ tools/inject.py doom_nowad.pdf -o doom.pdf --file iwad=doom1.wad
 - Terminal: one field per row. Keyboard: a multiline field whose keystroke action reports
   each change. Buttons: push buttons with mouse-down/up actions.
 - JavaScript: the page-open action runs a chain of Flate-compressed streams: runtime, files,
-  program, start.
+  program, start. The Emscripten code runs inside a function (`pdfcc.load`), so its globals
+  stay local and programs can share a document.
 - Runtime (`runtime/pdfcc_runtime.js`, `runtime/pdfcc.c`): `setTimeout`/`setInterval`/
   `performance` on top of `app.setTimeOut`; stdin/stdout devices; base64 file loading;
   error reporting to the terminal. The PDF global `print` (the document's print method) is
@@ -177,8 +201,11 @@ tools/inject.py doom_nowad.pdf -o doom.pdf --file iwad=doom1.wad
 
 - `tests/pdfsim.mjs`: runs a PDF in Node against a mock of the PDF JavaScript API and prints
   the terminal (and the display with `--display`). Input: `--type` (keystrokes), `--paste`
-  (one change), `--press`, `--click`, `--wait`.
+  (one change), `--press`, `--click`, `--wait`; `--program NAME` for a program built with
+  `--name`.
 - `tests/run_tests.sh`: checks the built examples with pdfsim.
+- `tests/tex_tests.sh`: builds LaTeX documents with each installed engine and checks their
+  fields and page actions (needs qpdf).
 - `tests/chrome.mjs`: drives Chrome's PDF viewer (`cd tests && npm install`).
 - `tests/measure_ramp.py fast|quality`: re-measures the display ramps.
 
